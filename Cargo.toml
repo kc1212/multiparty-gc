@@ -1,0 +1,10 @@
+[package]
+name = "multiparty-gc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bristol-fashion = { git = "https://github.com/GaloisInc/swanky", rev = "cd3862a" }
+scuttlebutt = { git = "https://github.com/GaloisInc/swanky", rev = "cd3862a" }
+swanky-field-binary = { git = "https://github.com/GaloisInc/swanky", rev = "cd3862a" }
+vectoreyes = { git = "https://github.com/GaloisInc/swanky", rev = "cd3862a" }
