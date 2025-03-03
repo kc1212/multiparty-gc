@@ -24,34 +24,41 @@ where
     pub mac_keys: BTreeMap<u16, MacFF>,
 }
 
-impl<ShareFF, MacFF> Add<&AuthShare<ShareFF, MacFF>> for AuthShare<ShareFF, MacFF>
-where
-    ShareFF: FiniteField,
-    MacFF: FiniteField,
-{
-    type Output = AuthShare<ShareFF, MacFF>;
+macro_rules! impl_add {
+    ($for_type:ty) => {
+        impl<ShareFF, MacFF> Add<&AuthShare<ShareFF, MacFF>> for $for_type
+        where
+            ShareFF: FiniteField,
+            MacFF: FiniteField,
+        {
+            type Output = AuthShare<ShareFF, MacFF>;
 
-    fn add(self, rhs: &AuthShare<ShareFF, MacFF>) -> Self::Output {
-        assert_eq!(self.party_id, rhs.party_id);
-        let new_share = self.share + rhs.share;
-        let new_mac_values = self
-            .mac_values
-            .keys()
-            .map(|j| (*j, self.mac_values[j] + rhs.mac_values[j]))
-            .collect::<BTreeMap<_, _>>();
-        let new_mac_keys = self
-            .mac_keys
-            .keys()
-            .map(|j| (*j, self.mac_keys[j] + rhs.mac_keys[j]))
-            .collect::<BTreeMap<_, _>>();
-        Self::Output {
-            party_id: self.party_id,
-            share: new_share,
-            mac_values: new_mac_values,
-            mac_keys: new_mac_keys,
+            fn add(self, rhs: &AuthShare<ShareFF, MacFF>) -> Self::Output {
+                assert_eq!(self.party_id, rhs.party_id);
+                let new_share = self.share + rhs.share;
+                let new_mac_values = self
+                    .mac_values
+                    .keys()
+                    .map(|j| (*j, self.mac_values[j] + rhs.mac_values[j]))
+                    .collect::<BTreeMap<_, _>>();
+                let new_mac_keys = self
+                    .mac_keys
+                    .keys()
+                    .map(|j| (*j, self.mac_keys[j] + rhs.mac_keys[j]))
+                    .collect::<BTreeMap<_, _>>();
+                Self::Output {
+                    party_id: self.party_id,
+                    share: new_share,
+                    mac_values: new_mac_values,
+                    mac_keys: new_mac_keys,
+                }
+            }
         }
-    }
+    };
 }
+
+impl_add!(AuthShare<ShareFF, MacFF>);
+impl_add!(&AuthShare<ShareFF, MacFF>);
 
 pub fn secret_share<ShareFF, MacFF, R>(
     secret: ShareFF,

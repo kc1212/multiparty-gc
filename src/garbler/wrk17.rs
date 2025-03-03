@@ -1,75 +1,113 @@
-use bristol_fashion::Circuit;
+use std::collections::BTreeMap;
+
+use bristol_fashion::{Circuit, Gate};
 use scuttlebutt::ring::FiniteRing;
-use swanky_field_binary::F128b;
+use swanky_field_binary::{F2, F128b};
 
 use crate::{prep::Preprocessor, sharing::AuthShare};
 
-use super::Garbler;
+use super::{GarbledTable, Garbler};
 
 pub struct Wrk17Garbler<P: Preprocessor> {
-    party_id: u32,
+    party_id: u16,
     preprocessor: P,
 }
 
 impl<P: Preprocessor> Wrk17Garbler<P> {
-    fn gen_input_labels(&mut self, inputs: u64, delta: F128b) -> (Vec<F128b>, Vec<F128b>) {
-        todo!()
+    fn gen_input_labels(&mut self, inputs: u64) -> BTreeMap<u64, F128b> {
+        if self.party_id != 0 {
+            // We only output the 0 wire label since the 1 wire label can be computed from the zero label
+            todo!()
+        }
+        BTreeMap::new()
     }
 }
 
-impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
-    fn party_id(&self) -> u32 {
+struct Wrk17GarbledAndGate {
+    row0: AuthShare<F2, F128b>,
+    row1: AuthShare<F2, F128b>,
+    row2: AuthShare<F2, F128b>,
+    row3: AuthShare<F2, F128b>,
+}
+
+struct Wrk17GarbledTable {
+    gates: Vec<Wrk17GarbledAndGate>,
+}
+
+impl GarbledTable for Wrk17GarbledTable {
+    type GarbledGate = Wrk17GarbledAndGate;
+
+    fn push_gate(&mut self, garbled_gate: Self::GarbledGate) {
+        self.gates.push(garbled_gate);
+    }
+
+    fn read_gate(&self, i: usize) -> &Self::GarbledGate {
+        &self.gates[i]
+    }
+}
+
+impl<P: Preprocessor> Garbler<Wrk17GarbledTable> for Wrk17Garbler<P> {
+    fn party_id(&self) -> u16 {
         self.party_id
     }
 
-    fn garble(&mut self, circuit: &Circuit) {
-        let delta = self.preprocessor.init();
-        // Circuit input wire masks and keys.
+    fn garble(&mut self, circuit: &Circuit, output: &mut Wrk17GarbledTable) {
         let input_bit_count: u64 = circuit.input_sizes().iter().sum();
-        let input_masks = self.preprocessor.random_bit(input_bit_count);
-        let (input_keys_0, input_keys_1) = self.gen_input_labels(input_bit_count, delta);
+        let delta = self.preprocessor.init_delta();
 
-        // Intermediate wire masks and keys.
-        // we need to prepare some data structures that will store
-        // the output wire keys/labels and masks so that they can be
-        // used in the loop below
-        let mut gate_output_keys = vec![None; circuit.gates().len() + input_bit_count as usize];
-        let mut gate_output_masks = vec![None; circuit.gates().len() + input_bit_count as usize];
+        let (mut auth_bits, mut auth_prods) =
+            self.preprocessor.auth_materials_from_circuit(circuit);
+        // Reverse the authenticated products since we're going to pop them later
+        auth_prods.reverse();
+        assert_eq!(
+            auth_prods.len(),
+            circuit
+                .gates()
+                .iter()
+                .filter(|g| matches!(g, Gate::AND { a: _, b: _, out: _ }))
+                .count()
+        );
+
+        let mut wire_labels = self.gen_input_labels(input_bit_count);
 
         for gate in circuit.gates() {
             match gate {
-                bristol_fashion::Gate::XOR { a, b, out } => {
-                    let lambda_u = gate_output_masks[*a as usize].as_ref().unwrap();
-                    let lambda_v = gate_output_masks[*b as usize].as_ref().unwrap();
-                    let lambda_w = self.preprocessor.add(lambda_u, lambda_v);
-                    gate_output_masks[*out as usize] = Some(lambda_w);
-
-                    // TODO do we need to store the intermediate 1-keys?
-                    let (k_u_0, k_u_1) = gate_output_keys[*a as usize].as_ref().unwrap();
-                    let (k_v_0, k_v_1) = gate_output_keys[*b as usize].as_ref().unwrap();
-                    let k_w_0 = k_u_0 + k_v_0;
-                    let k_w_1 = k_w_0 + delta;
-                    gate_output_keys[*out as usize] = Some((k_w_0, k_w_1));
+                Gate::XOR { a, b, out } => {
+                    let output_share = &auth_bits[a] + &auth_bits[b];
+                    assert!(auth_bits.get(out).is_none());
+                    auth_bits.insert(*out, output_share);
+                    if self.party_id != 0 {
+                        assert!(wire_labels.get(out).is_none());
+                        wire_labels.insert(*out, wire_labels[a] + wire_labels[b]);
+                    }
                 }
-                bristol_fashion::Gate::AND { a: _, b: _, out } => {
-                    let lambda_w = {
-                        let m = self.preprocessor.random_bit(1);
-                        m[0].clone()
+                Gate::AND { a, b, out } => {
+                    // we assume the and triples come in topological order
+                    let auth_prod = auth_prods.pop().unwrap();
+                    let row0 = &auth_prod + &auth_bits[out];
+                    let row1 = &row0 + &auth_bits[a];
+                    let row2 = &row0 + &auth_bits[b];
+                    let row3 = if self.party_id != 0 {
+                        let mut tmp = &row1 + &auth_bits[b];
+                        tmp.mac_keys.get_mut(&0).map(|x| *x += delta);
+                        tmp
+                    } else {
+                        let mut tmp = &row1 + &auth_bits[b];
+                        tmp.share += F2::ONE;
+                        tmp
                     };
-                    let and_keys = {
-                        let (k0, k1) = self.gen_input_labels(1, delta);
-                        (k0[0], k1[0])
+                    let garbled_gate = Wrk17GarbledAndGate {
+                        row0,
+                        row1,
+                        row2,
+                        row3,
                     };
-                    gate_output_masks[*out as usize] = Some(lambda_w);
-                    gate_output_keys[*out as usize] = Some(and_keys);
+                    output.push_gate(garbled_gate);
                 }
                 bristol_fashion::Gate::INV { a: _, out: _ } => todo!(),
                 bristol_fashion::Gate::EQ { lit: _, out: _ } => todo!(),
                 bristol_fashion::Gate::EQW { a: _, out: _ } => todo!(),
             }
         }
-        
-        // Generate garbled gates.
-        todo!()
     }
 }
