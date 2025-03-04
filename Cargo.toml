@@ -11,3 +11,5 @@ vectoreyes = { git = "https://github.com/GaloisInc/swanky", rev = "cd3862a" }
 rand = "0.8.5" # should match what is in swanky
 itertools = "0.13.0"
 thiserror = "2.0.11"
+blake3 = "1.6.1"
+generic-array = "1.1.1"

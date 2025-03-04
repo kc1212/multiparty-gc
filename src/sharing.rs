@@ -1,11 +1,19 @@
+use generic_array::GenericArray;
 use itertools::{Itertools, izip};
 use rand::{CryptoRng, Rng};
-use scuttlebutt::field::{FiniteField, IsSubFieldOf};
-use std::{collections::BTreeMap, ops::Add};
+use scuttlebutt::{
+    field::{FiniteField, IsSubFieldOf},
+    serialization::CanonicalSerialize,
+};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    ops::Add,
+};
 
 use crate::error::GcError;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthShare<ShareFF, MacFF>
 where
     ShareFF: FiniteField,
@@ -22,6 +30,35 @@ where
     /// The MAC keys K_i[x^j], where value K_i[x^j] is under key i.
     /// The btree is keyed on j (the other party's index).
     pub mac_keys: BTreeMap<u16, MacFF>,
+}
+
+impl<ShareFF, MacFF> AuthShare<ShareFF, MacFF>
+where
+    ShareFF: FiniteField,
+    MacFF: FiniteField + CanonicalSerialize,
+{
+    pub fn serialize_mac_values<W: Write>(&self, writer: &mut W) {
+        // iterating is sorted by key
+        for v in self.mac_values.values() {
+            writer.write(&v.to_bytes()).unwrap();
+        }
+        writer.flush().unwrap()
+    }
+
+    pub fn deserialize_mac_values<R: Read>(&mut self, party_count: u16, reader: &mut R) {
+        if !self.mac_values.is_empty() {
+            panic!("reading mac values into AuthShare that's not empty")
+        }
+        let mut buf = GenericArray::<u8, MacFF::ByteReprLen>::default();
+        for i in 0..party_count {
+            if i != self.party_id {
+                reader
+                    .read_exact(&mut buf)
+                    .expect(&format!("reading failed for i={i}"));
+                self.mac_values.insert(i, MacFF::from_bytes(&buf).unwrap());
+            }
+        }
+    }
 }
 
 macro_rules! impl_add {
@@ -157,6 +194,8 @@ where
 
 #[cfg(test)]
 mod test {
+    use std::io::Cursor;
+
     use super::*;
     use scuttlebutt::{AesRng, ring::FiniteRing};
     use swanky_field_binary::{F2, F128b};
@@ -187,5 +226,24 @@ mod test {
             deltas[0] += F128b::ONE;
             verify_and_reconstruct(n, shares, deltas).unwrap_err();
         }
+    }
+
+    #[test]
+    fn test_reading_mac_values() {
+        let mut rng = AesRng::new();
+        let n = 10u16;
+        let secret = F2::random(&mut rng);
+        let (shares, _deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
+
+        let mut writer = Cursor::new(vec![]);
+        let share_orig = shares[0].clone();
+        let mut share_new = share_orig.clone();
+        share_new.mac_values = BTreeMap::new();
+
+        share_orig.serialize_mac_values(&mut writer);
+        assert_eq!(writer.get_ref().len(), (n as usize - 1) * (128 / 8));
+
+        let mut buf = Cursor::new(writer.into_inner());
+        share_new.deserialize_mac_values(n, &mut buf);
     }
 }

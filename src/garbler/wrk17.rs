@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use bristol_fashion::{Circuit, Gate};
+use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
 
@@ -14,12 +15,52 @@ pub struct Wrk17Garbler<P: Preprocessor> {
 }
 
 impl<P: Preprocessor> Wrk17Garbler<P> {
-    fn gen_input_labels(&mut self, inputs: u64) -> BTreeMap<u64, F128b> {
+    fn gen_labels<R>(&mut self, rng: &mut R, circuit: &Circuit) -> BTreeMap<u64, F128b>
+    where
+        R: Rng + CryptoRng,
+    {
+        let mut output = BTreeMap::new();
         if self.party_id != 0 {
-            // We only output the 0 wire label since the 1 wire label can be computed from the zero label
-            todo!()
+            // TODO not the most efficient way to make labels
+            // a better way would to find all the wire IDs first
+            for gate in circuit.gates() {
+                match gate {
+                    Gate::XOR { a, b, out } => {
+                        output.entry(*a).or_insert_with(|| F128b::random(rng));
+                        output.entry(*b).or_insert_with(|| F128b::random(rng));
+                        output.entry(*out).or_insert_with(|| F128b::random(rng));
+                    }
+                    Gate::AND { a, b, out } => {
+                        output.entry(*a).or_insert_with(|| F128b::random(rng));
+                        output.entry(*b).or_insert_with(|| F128b::random(rng));
+                        output.entry(*out).or_insert_with(|| F128b::random(rng));
+                    }
+                    Gate::INV { a, out } => {
+                        output.entry(*a).or_insert_with(|| F128b::random(rng));
+                        output.entry(*out).or_insert_with(|| F128b::random(rng));
+                    }
+                    Gate::EQ { lit: _, out: _ } => unimplemented!("EQ gate is not implemented"),
+                    Gate::EQW { a: _, out: _ } => unimplemented!("EQW gate is not implemented"),
+                }
+            }
         }
-        BTreeMap::new()
+        output
+    }
+}
+
+struct Wrk17GarbledRow {
+    inner: Vec<u8>,
+}
+
+impl Wrk17GarbledRow {
+    fn encrypt_row(
+        share: AuthShare<F2, F128b>,
+        label_a: F128b,
+        label_b: F128b,
+        label_gamma: F128b,
+        gate_id: u64,
+    ) -> Self {
+        todo!()
     }
 }
 
@@ -51,8 +92,10 @@ impl<P: Preprocessor> Garbler<Wrk17GarbledTable> for Wrk17Garbler<P> {
         self.party_id
     }
 
-    fn garble(&mut self, circuit: &Circuit, output: &mut Wrk17GarbledTable) {
-        let input_bit_count: u64 = circuit.input_sizes().iter().sum();
+    fn garble<R>(&mut self, rng: &mut R, circuit: &Circuit, output: &mut Wrk17GarbledTable)
+    where
+        R: Rng + CryptoRng,
+    {
         let delta = self.preprocessor.init_delta();
 
         let (mut auth_bits, mut auth_prods) =
@@ -68,7 +111,7 @@ impl<P: Preprocessor> Garbler<Wrk17GarbledTable> for Wrk17Garbler<P> {
                 .count()
         );
 
-        let mut wire_labels = self.gen_input_labels(input_bit_count);
+        let mut wire_labels = self.gen_labels(rng, circuit);
 
         for gate in circuit.gates() {
             match gate {
