@@ -113,7 +113,6 @@ impl Wrk17GarbledRow {
         to_encrypt
             .write(&label_gamma_xor_sum_key.to_bytes())
             .unwrap();
-        // to_encrypt.flush().unwrap();
 
         // Expand the xof and use it as the key to encrypt the buffer `to_encrypt`
         let mut xof_buf = vec![0u8; output_len];
@@ -262,20 +261,21 @@ impl Wrk17AllGarbledGate {
     }
 }
 
-struct Wrk17Garbling {
-    gates: Vec<Wrk17GarbledGate>,
+enum Wrk17Garbling {
+    Garbler(Vec<Wrk17GarbledGate>),
+    Evaluator(Vec<[AuthShare<F2, F128b>; 4]>),
 }
 
 impl Garbling for Wrk17Garbling {
     type GarbledGate = Wrk17GarbledGate;
 
-    fn push_gate(&mut self, garbled_gate: Self::GarbledGate) {
-        self.gates.push(garbled_gate);
-    }
+    // fn push_gate(&mut self, garbled_gate: Self::GarbledGate) {
+    //     self.gates.push(garbled_gate);
+    // }
 
-    fn read_gate(&self, i: usize) -> &Self::GarbledGate {
-        &self.gates[i]
-    }
+    // fn read_gate(&self, i: usize) -> &Self::GarbledGate {
+    //     &self.gates[i]
+    // }
 }
 
 impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
@@ -283,14 +283,16 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
         self.party_id
     }
 
-    fn garble<R>(&mut self, rng: &mut R, circuit: &Circuit, output: &mut Wrk17Garbling)
+    fn garble<R>(&mut self, rng: &mut R, circuit: &Circuit) -> Wrk17Garbling
     where
         R: Rng + CryptoRng,
     {
         let delta = self.preprocessor.init_delta();
+        let gate_count = circuit.gates().len();
 
         let (mut auth_bits, mut auth_prods) =
             self.preprocessor.auth_materials_from_circuit(circuit);
+
         // Reverse the authenticated products since we're going to pop them later
         auth_prods.reverse();
         assert_eq!(
@@ -304,6 +306,9 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
 
         let mut wire_labels = self.gen_labels(rng, circuit);
 
+        let mut garbler_output = Vec::with_capacity(if self.is_garbler() { gate_count } else { 0 });
+        let mut eval_output =
+            Vec::with_capacity(if self.is_garbler() { 0 } else { gate_count });
         for gate in circuit.gates() {
             match gate {
                 Gate::XOR { a, b, out } => {
@@ -330,56 +335,65 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
                         tmp.share += F2::ONE;
                         tmp
                     };
-                    let label_a_0 = wire_labels[a];
-                    let label_b_0 = wire_labels[b];
-                    let label_gamma_0 = wire_labels[out];
-                    let garbled_gate = Wrk17GarbledGate {
-                        party_id: self.party_id,
-                        rows: [
-                            Wrk17GarbledRow::encrypt_row(
-                                &share0,
-                                delta,
-                                label_a_0,
-                                label_b_0,
-                                label_gamma_0,
-                                *out,
-                                0,
-                            ),
-                            Wrk17GarbledRow::encrypt_row(
-                                &share1,
-                                delta,
-                                label_a_0,
-                                label_b_0,
-                                label_gamma_0,
-                                *out,
-                                1,
-                            ),
-                            Wrk17GarbledRow::encrypt_row(
-                                &share2,
-                                delta,
-                                label_a_0,
-                                label_b_0,
-                                label_gamma_0,
-                                *out,
-                                2,
-                            ),
-                            Wrk17GarbledRow::encrypt_row(
-                                &share3,
-                                delta,
-                                label_a_0,
-                                label_b_0,
-                                label_gamma_0,
-                                *out,
-                                3,
-                            ),
-                        ],
-                    };
-                    output.push_gate(garbled_gate);
+                    if self.is_garbler() {
+                        let label_a_0 = wire_labels[a];
+                        let label_b_0 = wire_labels[b];
+                        let label_gamma_0 = wire_labels[out];
+                        let garbled_gate = Wrk17GarbledGate {
+                            party_id: self.party_id,
+                            rows: [
+                                Wrk17GarbledRow::encrypt_row(
+                                    &share0,
+                                    delta,
+                                    label_a_0,
+                                    label_b_0,
+                                    label_gamma_0,
+                                    *out,
+                                    0,
+                                ),
+                                Wrk17GarbledRow::encrypt_row(
+                                    &share1,
+                                    delta,
+                                    label_a_0,
+                                    label_b_0,
+                                    label_gamma_0,
+                                    *out,
+                                    1,
+                                ),
+                                Wrk17GarbledRow::encrypt_row(
+                                    &share2,
+                                    delta,
+                                    label_a_0,
+                                    label_b_0,
+                                    label_gamma_0,
+                                    *out,
+                                    2,
+                                ),
+                                Wrk17GarbledRow::encrypt_row(
+                                    &share3,
+                                    delta,
+                                    label_a_0,
+                                    label_b_0,
+                                    label_gamma_0,
+                                    *out,
+                                    3,
+                                ),
+                            ],
+                        };
+                        garbler_output.push(garbled_gate);
+                    } else {
+                        eval_output.push([share0, share1, share2, share3]);
+                    }
                 }
                 bristol_fashion::Gate::INV { a: _, out: _ } => todo!(),
                 bristol_fashion::Gate::EQ { lit: _, out: _ } => todo!(),
                 bristol_fashion::Gate::EQW { a: _, out: _ } => todo!(),
             }
+        }
+        if self.is_garbler() {
+            Wrk17Garbling::Garbler(garbler_output)
+        } else {
+            Wrk17Garbling::Evaluator(eval_output)
         }
     }
 }
