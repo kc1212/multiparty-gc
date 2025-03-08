@@ -1,8 +1,12 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    io::{Cursor, Read, Write},
+};
 
 use bristol_fashion::{Circuit, Gate};
 use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
+use scuttlebutt::serialization::CanonicalSerialize;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{prep::Preprocessor, sharing::AuthShare};
@@ -53,14 +57,67 @@ struct Wrk17GarbledRow {
 }
 
 impl Wrk17GarbledRow {
+    // we need to encrypt the row with
+    // H(L_a, L_b, gate_id, row_id)
+    // and we need to encrypt the MAC keys with L_gamma
     fn encrypt_row(
         share: AuthShare<F2, F128b>,
-        label_a: F128b,
-        label_b: F128b,
+        delta: F128b,
+        label_a_0: F128b,
+        label_b_0: F128b,
         label_gamma: F128b,
         gate_id: u64,
+        row_id: u8,
     ) -> Self {
-        todo!()
+        // Create XOF of H(L_a, L_b, gate_id, row_id)
+        let mut hasher = blake3::Hasher::new();
+        assert!(row_id <= 3);
+        let label_a = label_a_0
+            + if (row_id ^ 1) == 0 {
+                F128b::ZERO
+            } else {
+                delta
+            };
+        let label_b = label_b_0
+            + if ((row_id >> 1) ^ 1) == 0 {
+                F128b::ZERO
+            } else {
+                delta
+            };
+        hasher.update(&label_a.to_bytes());
+        hasher.update(&label_b.to_bytes());
+        hasher.update(&gate_id.to_le_bytes());
+        hasher.update(&row_id.to_le_bytes());
+        let mut xof_reader = hasher.finalize_xof();
+
+        // Use the XOF to encrypt the following byte buffer
+        // r^i (1 bit) || {M_j[r^1]} (128 * (n-1) bits) || L_gamma xor (sum K_i[r^j]) xor r^i \Delta_i
+        let output_len = 1 + 128 / 8 * share.mac_keys.len() + 128 / 8;
+        let mut to_encrypt = Cursor::new(Vec::<u8>::with_capacity(output_len));
+        let r = share.share;
+        to_encrypt.write(&r.to_bytes()).unwrap();
+        share.serialize_mac_values(&mut to_encrypt);
+
+        // L_gamma xor (sum K_i[r^j]) xor r^i \Delta_i
+        let label_gamma_xor_sum_key =
+            label_gamma + share.sum_mac_keys() + if r == F2::ZERO { F128b::ZERO } else { delta };
+        to_encrypt
+            .write(&label_gamma_xor_sum_key.to_bytes())
+            .unwrap();
+        // to_encrypt.flush().unwrap();
+
+        // Expand the xof and use it as the key to encrypt the buffer `to_encrypt`
+        let mut xof_buf = vec![0u8; output_len];
+        xof_reader.fill(&mut xof_buf);
+        let to_encrypt = to_encrypt.into_inner();
+        assert_eq!(xof_buf.len(), to_encrypt.len());
+        Self {
+            inner: to_encrypt
+                .into_iter()
+                .zip(xof_buf)
+                .map(|(a, b)| a ^ b)
+                .collect(),
+        }
     }
 }
 
@@ -152,5 +209,29 @@ impl<P: Preprocessor> Garbler<Wrk17GarbledTable> for Wrk17Garbler<P> {
                 bristol_fashion::Gate::EQW { a: _, out: _ } => todo!(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scuttlebutt::AesRng;
+
+    use crate::sharing::secret_share;
+
+    use super::*;
+
+    #[test]
+    fn test_encrypt_row() {
+        let mut rng = AesRng::new();
+        let n = 10u16;
+        let secret = F2::random(&mut rng);
+        let (shares, deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
+        let share = shares[0].clone();
+        let delta = deltas[0];
+        let label_a_0 = F128b::random(&mut rng);
+        let label_b_0 = F128b::random(&mut rng);
+        let label_gamma = F128b::random(&mut rng);
+        let _row =
+            Wrk17GarbledRow::encrypt_row(share, delta, label_a_0, label_b_0, label_gamma, 12, 0);
     }
 }

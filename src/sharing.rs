@@ -42,7 +42,6 @@ where
         for v in self.mac_values.values() {
             writer.write(&v.to_bytes()).unwrap();
         }
-        writer.flush().unwrap()
     }
 
     pub fn deserialize_mac_values<R: Read>(&mut self, party_count: u16, reader: &mut R) {
@@ -58,6 +57,11 @@ where
                 self.mac_values.insert(i, MacFF::from_bytes(&buf).unwrap());
             }
         }
+    }
+
+    pub fn sum_mac_keys(&self) -> MacFF {
+        // Sum trait is not implemented, so we use fold
+        self.mac_keys.values().fold(MacFF::ZERO, |acc, x| acc + *x)
     }
 }
 
