@@ -63,6 +63,27 @@ where
         // Sum trait is not implemented, so we use fold
         self.mac_keys.values().fold(MacFF::ZERO, |acc, x| acc + *x)
     }
+
+    pub fn check_against_incoming_macs(
+        &self,
+        mac_values: &[MacFF],
+        delta: &MacFF,
+    ) -> Result<(), GcError>
+    where
+        ShareFF: IsSubFieldOf<MacFF>,
+    {
+        // if MACs are given as a vector
+        // we assume they're indexed from 0 to n-2 (length of n-1)
+        let final_index = mac_values.len() as u16;
+        assert!(!self.mac_keys.keys().contains(&final_index));
+        assert_eq!(self.party_id, final_index);
+        for (key, mac) in self.mac_keys.values().zip(mac_values) {
+            if *mac != (self.share * *delta) + *key {
+                return Err(GcError::MacCheckFailure);
+            }
+        }
+        Ok(())
+    }
 }
 
 macro_rules! impl_add {
