@@ -61,7 +61,7 @@ impl<P: Preprocessor> Wrk17Garbler<P> {
     }
 }
 
-struct Wrk17GarbledRow {
+pub struct Wrk17GarbledRow {
     inner: Vec<u8>,
 }
 
@@ -129,7 +129,7 @@ impl Wrk17GarbledRow {
     }
 }
 
-struct Wrk17GarbledGate {
+pub struct Wrk17GarbledGate {
     party_id: u16,
     rows: [Wrk17GarbledRow; 4],
 }
@@ -142,132 +142,127 @@ impl Index<u8> for Wrk17GarbledGate {
     }
 }
 
-struct Wrk17AllGarbledGate {
+/// Called by party_id = n-1, the evaluator
+///
+/// - `garbled_gates`: one garbled gate for each garbler (there are n-1 garblers)
+/// - `a`: a masked wire value, z_a + \lambda_a
+/// - `b`: a masked wire value, z_b + \lambda_b
+/// - `label_as`: wire labels for the wire `a`, one for every party
+/// - `label_bs`: wire labels for the wire `b`, one for every party
+/// - `gate_id`: the gate ID (value of the output wire)
+/// - `evaluator_shares`: shares produced by the evaluator during garbling, i.e.,
+///   r^1_{\gamma, \ell}, { M_j[r^1_{\gamma, \ell}], K_1[r^i_{\gamma, \ell}] }
+/// - `evaluator_delta`: the delta of the evaluator
+pub(crate) fn decrypt_garbled_gate(
+    garbled_gates: &[Wrk17GarbledGate],
+    a: F2,
+    b: F2,
+    label_as: &[F128b],
+    label_bs: &[F128b],
+    gate_id: u64,
+    evaluator_shares: &[AuthShare<F2, F128b>], // indexed over the 4 rows
+    evaluator_delta: F128b,
+) -> Result<(F2, Vec<F128b>), GcError> {
+    // first get the row that we want to decrypt
+    // row_id is \ell
+    // TODO check order
+    let row_id = match (<bool as From<F2>>::from(b), <bool as From<F2>>::from(a)) {
+        (true, true) => 3,
+        (true, false) => 2,
+        (false, true) => 1,
+        (false, false) => 0u8,
+    };
+    assert_eq!(garbled_gates.len(), label_as.len());
+    assert_eq!(garbled_gates.len(), label_bs.len());
+    let party_count = garbled_gates.len() + 1;
+    let evaluator_index = party_count as u16 - 1;
+    let mut output_share = F2::ZERO;
+    let mut output_label = vec![F128b::ZERO; party_count - 1];
+    for party_id in 0..garbled_gates.len() {
+        assert_eq!(garbled_gates[party_id].party_id as usize, party_id);
+
+        // G_{\gamma,\ell}^i
+        let garbled_row = &garbled_gates[party_id][row_id].inner;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&label_as[party_id].to_bytes());
+        hasher.update(&label_bs[party_id].to_bytes());
+        hasher.update(&gate_id.to_le_bytes());
+        hasher.update(&row_id.to_le_bytes());
+        let mut xof_reader = hasher.finalize_xof();
+
+        // H(L_a, L_b, \gamma, \ell)
+        let mut buf = vec![0u8; garbled_row.len()];
+        xof_reader.fill(&mut buf);
+
+        // G_{\gamma,\ell}^i xor H(L_a, L_b, \gamma, \ell)
+        for (b, g) in buf.iter_mut().zip(garbled_row) {
+            *b ^= *g;
+        }
+
+        // In the cursor, first byte is r, then we have the MACs, finally the label
+        let mut cursor = Cursor::new(buf);
+
+        // First read the byte and convert it to F2
+        let mut r_buf = [0u8; 1];
+        cursor.read(&mut r_buf).unwrap();
+        let r = F2::from_bytes((&r_buf).into()).unwrap();
+
+        // Second read the MACs
+        // M_j[r^i_{\gamma, \ell}], i is fixed in every iteration, j \in [n] \ i
+        let mut r_share: AuthShare<_, F128b> = AuthShare {
+            party_id: party_id as u16,
+            share: r,
+            mac_values: BTreeMap::new(),
+            mac_keys: BTreeMap::new(),
+        };
+        // TODO do we need to deserialize everything?
+        r_share.deserialize_mac_values(party_count as u16, &mut cursor);
+        assert_eq!(r_share.mac_values.len(), party_count - 1);
+
+        // Finally read the label: L_\gamma^i
+        let mut label_gamma_buf =
+            GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
+        cursor.read_exact(&mut label_gamma_buf).unwrap();
+        let label_gamma = F128b::from_bytes(&label_gamma_buf).unwrap();
+
+        // perform mac check:
+        // r^i_{\gamma, \ell} * \Delta_1 + K_1[r^i_{\gamma, \ell}] = M_1[r^i_{\gamma, \ell}]
+        // where i is party_id
+        if r_share.share * evaluator_delta
+            + evaluator_shares[row_id as usize].mac_keys[&(party_id as u16)]
+            != r_share.mac_values[&evaluator_index]
+        {
+            return Err(GcError::MacCheckFailure);
+        }
+
+        // \sum r^i_{\gamma, \ell} = z_\gamma + \lambda_\gamma
+        output_share += r_share.share;
+
+        // If the labels start as zero, first set the labels to be
+        // [L^0, L^1, ..., L^{n-1}]
+        // Then we need to xor each label L^i with \sum_j M_i[r^j_{\gamma, \ell}]
+        // But we're given M_j[r^i_{\gamma, \ell}] (note i and j are reversed)
+        // So we iterate over j and add the MACs to each L^i.
+        output_label[party_id] += label_gamma;
+        for (k, v) in r_share.mac_values {
+            output_label[k as usize] += v;
+        }
+    }
+
+    Ok((output_share, output_label))
+}
+
+pub enum Wrk17Garbling {
     // the index (starting from 0) should correspond to the party_id
     // the length should be exactly n-1
     // party_id = n-1 is the evaluator
-    inner: Vec<Wrk17GarbledGate>,
-}
-
-impl Wrk17AllGarbledGate {
-    /// Called by party_id = n-1, the evaluator
-    ///
-    /// - `a`: a masked wire value, z_a + \lambda_a
-    /// - `b`: a masked wire value, z_b + \lambda_b
-    /// - `label_as`: wire labels for the wire `a`, one for every party
-    /// - `label_bs`: wire labels for the wire `b`, one for every party
-    /// - `gate_id`: the gate ID (value of the output wire)
-    /// - `evaluator_shares`: shares produced by the evaluator during garbling, i.e.,
-    ///   r^1_{\gamma, \ell}, { M_j[r^1_{\gamma, \ell}], K_1[r^i_{\gamma, \ell}] }
-    /// - `evaluator_delta`: the delta of the evaluator
-    fn decrypt(
-        &self,
-        a: F2,
-        b: F2,
-        label_as: &[F128b],
-        label_bs: &[F128b],
-        gate_id: u64,
-        evaluator_shares: &[AuthShare<F2, F128b>], // indexed over the 4 rows
-        evaluator_delta: F128b,
-    ) -> Result<(F2, Vec<F128b>), GcError> {
-        // first get the row that we want to decrypt
-        // row_id is \ell
-        // TODO check order
-        let row_id = match (<bool as From<F2>>::from(b), <bool as From<F2>>::from(a)) {
-            (true, true) => 3,
-            (true, false) => 2,
-            (false, true) => 1,
-            (false, false) => 0u8,
-        };
-        assert_eq!(self.inner.len(), label_as.len());
-        assert_eq!(self.inner.len(), label_bs.len());
-        let party_count = self.inner.len() + 1;
-        let evaluator_index = party_count as u16 - 1;
-        let mut output_share = F2::ZERO;
-        let mut output_label = vec![F128b::ZERO; party_count - 1];
-        for party_id in 0..self.inner.len() {
-            assert_eq!(self.inner[party_id].party_id as usize, party_id);
-
-            // G_{\gamma,\ell}^i
-            let garbled_row = &self.inner[party_id][row_id].inner;
-
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&label_as[party_id].to_bytes());
-            hasher.update(&label_bs[party_id].to_bytes());
-            hasher.update(&gate_id.to_le_bytes());
-            hasher.update(&row_id.to_le_bytes());
-            let mut xof_reader = hasher.finalize_xof();
-
-            // H(L_a, L_b, \gamma, \ell)
-            let mut buf = vec![0u8; garbled_row.len()];
-            xof_reader.fill(&mut buf);
-
-            // G_{\gamma,\ell}^i xor H(L_a, L_b, \gamma, \ell)
-            for (b, g) in buf.iter_mut().zip(garbled_row) {
-                *b ^= *g;
-            }
-
-            // In the cursor, first byte is r, then we have the MACs, finally the label
-            let mut cursor = Cursor::new(buf);
-
-            // First read the byte and convert it to F2
-            let mut r_buf = [0u8; 1];
-            cursor.read(&mut r_buf).unwrap();
-            let r = F2::from_bytes((&r_buf).into()).unwrap();
-
-            // Second read the MACs
-            // M_j[r^i_{\gamma, \ell}], i is fixed in every iteration, j \in [n] \ i
-            let mut r_share: AuthShare<_, F128b> = AuthShare {
-                party_id: party_id as u16,
-                share: r,
-                mac_values: BTreeMap::new(),
-                mac_keys: BTreeMap::new(),
-            };
-            // TODO do we need to deserialize everything?
-            r_share.deserialize_mac_values(party_count as u16, &mut cursor);
-            assert_eq!(r_share.mac_values.len(), party_count - 1);
-
-            // Finally read the label: L_\gamma^i
-            let mut label_gamma_buf =
-                GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
-            cursor.read_exact(&mut label_gamma_buf).unwrap();
-            let label_gamma = F128b::from_bytes(&label_gamma_buf).unwrap();
-
-            // perform mac check:
-            // r^i_{\gamma, \ell} * \Delta_1 + K_1[r^i_{\gamma, \ell}] = M_1[r^i_{\gamma, \ell}]
-            // where i is party_id
-            if r_share.share * evaluator_delta
-                + evaluator_shares[row_id as usize].mac_keys[&(party_id as u16)]
-                != r_share.mac_values[&evaluator_index]
-            {
-                return Err(GcError::MacCheckFailure);
-            }
-
-            // \sum r^i_{\gamma, \ell} = z_\gamma + \lambda_\gamma
-            output_share += r_share.share;
-
-            // If the labels start as zero, first set the labels to be
-            // [L^0, L^1, ..., L^{n-1}]
-            // Then we need to xor each label L^i with \sum_j M_i[r^j_{\gamma, \ell}]
-            // But we're given M_j[r^i_{\gamma, \ell}] (note i and j are reversed)
-            // So we iterate over j and add the MACs to each L^i.
-            output_label[party_id] += label_gamma;
-            for (k, v) in r_share.mac_values {
-                output_label[k as usize] += v;
-            }
-        }
-
-        Ok((output_share, output_label))
-    }
-}
-
-enum Wrk17Garbling {
     Garbler(Vec<Wrk17GarbledGate>),
     Evaluator(Vec<[AuthShare<F2, F128b>; 4]>),
 }
 
 impl Garbling for Wrk17Garbling {
-    type GarbledGate = Wrk17GarbledGate;
+    // type GarbledGate = Wrk17GarbledGate;
 
     // fn push_gate(&mut self, garbled_gate: Self::GarbledGate) {
     //     self.gates.push(garbled_gate);
@@ -276,6 +271,22 @@ impl Garbling for Wrk17Garbling {
     // fn read_gate(&self, i: usize) -> &Self::GarbledGate {
     //     &self.gates[i]
     // }
+}
+
+impl Wrk17Garbling {
+    pub fn get_garbler_gates(self) -> Vec<Wrk17GarbledGate> {
+        match self {
+            Wrk17Garbling::Garbler(inner) => inner,
+            Wrk17Garbling::Evaluator(_) => panic!("not a garbler"),
+        }
+    }
+
+    pub fn get_evaluator_gates(self) -> Vec<[AuthShare<F2, F128b>; 4]> {
+        match self {
+            Wrk17Garbling::Garbler(_) => panic!("not an evaluator"),
+            Wrk17Garbling::Evaluator(inner) => inner,
+        }
+    }
 }
 
 impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
@@ -306,9 +317,9 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
 
         let mut wire_labels = self.gen_labels(rng, circuit);
 
+        // [gate_index][]
         let mut garbler_output = Vec::with_capacity(if self.is_garbler() { gate_count } else { 0 });
-        let mut eval_output =
-            Vec::with_capacity(if self.is_garbler() { 0 } else { gate_count });
+        let mut eval_output = Vec::with_capacity(if self.is_garbler() { 0 } else { gate_count });
         for gate in circuit.gates() {
             match gate {
                 Gate::XOR { a, b, out } => {

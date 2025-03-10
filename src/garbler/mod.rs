@@ -1,13 +1,12 @@
 use bristol_fashion::Circuit;
 use rand::{CryptoRng, Rng};
 
-mod wrk17;
+pub mod wrk17;
 
-pub trait Garbler<GT: Garbling> {
-    fn garble<R: Rng + CryptoRng>(&mut self, rng: &mut R, circuit: &Circuit) -> GT;
+pub trait Garbler<G: Garbling> {
+    fn garble<R: Rng + CryptoRng>(&mut self, rng: &mut R, circuit: &Circuit) -> G;
     fn party_id(&self) -> u16;
 }
 
 pub trait Garbling {
-    type GarbledGate;
 }
