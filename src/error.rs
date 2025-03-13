@@ -4,4 +4,6 @@ use thiserror::Error;
 pub enum GcError {
     #[error("MAC check failure")]
     MacCheckFailure,
+    #[error("Decoder MAC check failure")]
+    DecoderCheckFailure,
 }

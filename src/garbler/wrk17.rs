@@ -253,12 +253,19 @@ pub(crate) fn decrypt_garbled_gate(
     Ok((output_share, output_label))
 }
 
+pub struct Wrk17EvaluatorOutput {
+    garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
+    // TODO we can just use a Vec here, only need the final shares for the output wires
+    wire_mask_shares: BTreeMap<u64, AuthShare<F2, F128b>>,
+    delta: F128b,
+}
+
 pub enum Wrk17Garbling {
     // the index (starting from 0) should correspond to the party_id
     // the length should be exactly n-1
     // party_id = n-1 is the evaluator
     Garbler(Vec<Wrk17GarbledGate>),
-    Evaluator(Vec<[AuthShare<F2, F128b>; 4]>),
+    Evaluator(Wrk17EvaluatorOutput),
 }
 
 impl Garbling for Wrk17Garbling {
@@ -281,7 +288,7 @@ impl Wrk17Garbling {
         }
     }
 
-    pub fn get_evaluator_gates(self) -> Vec<[AuthShare<F2, F128b>; 4]> {
+    pub fn get_evaluator_gates(self) -> Wrk17EvaluatorOutput {
         match self {
             Wrk17Garbling::Garbler(_) => panic!("not an evaluator"),
             Wrk17Garbling::Evaluator(inner) => inner,
@@ -317,7 +324,6 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
 
         let mut wire_labels = self.gen_labels(rng, circuit);
 
-        // [gate_index][]
         let mut garbler_output = Vec::with_capacity(if self.is_garbler() { gate_count } else { 0 });
         let mut eval_output = Vec::with_capacity(if self.is_garbler() { 0 } else { gate_count });
         for gate in circuit.gates() {
@@ -404,7 +410,11 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
         if self.is_garbler() {
             Wrk17Garbling::Garbler(garbler_output)
         } else {
-            Wrk17Garbling::Evaluator(eval_output)
+            Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
+                garbling_shares: eval_output,
+                wire_mask_shares: auth_bits,
+                delta,
+            })
         }
     }
 }

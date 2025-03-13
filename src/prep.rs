@@ -27,7 +27,10 @@ pub trait StaticPreprocessor {
     fn auth_materials_from_circuit(
         &mut self,
         circ: &Circuit,
-    ) -> (BTreeMap<u64, AuthShare<F2, F128b>>, Vec<AuthShare<F2, F128b>>);
+    ) -> (
+        BTreeMap<u64, AuthShare<F2, F128b>>,
+        Vec<AuthShare<F2, F128b>>,
+    );
 
     /// Compute z = x*y and then output unauthenticated shares <x * \Delta^i>
     fn and_output_mask(&mut self, x: &AuthShare<F2, F128b>, y: &AuthShare<F2, F128b>)

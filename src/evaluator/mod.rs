@@ -20,5 +20,9 @@ trait Evaluator {
         input_labels: Vec<Vec<Self::Label>>,
     ) -> Result<Self::GarbledOutput, GcError>;
 
-    fn decode(&self, encoded: Self::GarbledOutput, decoder: Self::Decoder) -> Vec<u8>;
+    fn decode(
+        &self,
+        encoded: Self::GarbledOutput,
+        decoder: Self::Decoder,
+    ) -> Result<Vec<u8>, GcError>;
 }

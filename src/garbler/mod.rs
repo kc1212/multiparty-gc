@@ -8,5 +8,4 @@ pub trait Garbler<G: Garbling> {
     fn party_id(&self) -> u16;
 }
 
-pub trait Garbling {
-}
+pub trait Garbling {}

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use bristol_fashion::{Circuit, Gate};
 use itertools::Itertools;
 use scuttlebutt::ring::FiniteRing;
@@ -14,20 +16,22 @@ use super::Evaluator;
 struct Wrk17Evaluator {
     /// Ordererd by topological order of AND gate
     /// r^1_{\gamma, \ell}, {M_j[r^1_{\gamma, \ell}]}, {K_1[r^j_{\gamma, \ell}]}
-    shares: Vec<[AuthShare<F2, F128b>; 4]>,
+    garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
+    /// Shares of the final output wire masks \lambda_w,
+    /// w are the circuit output wires
+    wire_mask_shares: Vec<AuthShare<F2, F128b>>,
     delta: F128b,
 }
 
 struct Wrk17EncodedOutput {
-    // inner[i][j] means ith output for jth party
-    // first element is the share, r^0, ..., r^{n-2}, r^{n-1}
-    // where the sum of those shares above is the masked output
-    // second element is the MAC key K_1[r^0], ..., K_1[r^{n-2}]
-    inner: Vec<Vec<(F2, F128b)>>,
+    masked_output_values: Vec<F2>,
 }
 
 struct Wrk17Decoder {
-    inner: Vec<F128b>,
+    // To decode, each party needs to send
+    // { (r^i_w, M_1[r^i_w]) } to the evaluator
+    // inner[i][j] is the ith wire and jth party
+    inner: Vec<Vec<(F2, F128b)>>,
 }
 
 impl Evaluator for Wrk17Evaluator {
@@ -54,7 +58,7 @@ impl Evaluator for Wrk17Evaluator {
         let mut masked_wire_values = [masked_inputs, vec![F2::ZERO; gate_count]].concat();
 
         // TODO avoid these transposes
-        // labels[i][j] means the label for party j on wire i,
+        // labels[i][j] means the label on wire i and party j,
         // this is different from the input_labels because we've transposed it
         let mut labels: Vec<Vec<F128b>> = transpose(
             input_labels
@@ -95,7 +99,7 @@ impl Evaluator for Wrk17Evaluator {
                         &labels[*a as usize],
                         &labels[*b as usize],
                         *out,
-                        &self.shares[*out as usize],
+                        &self.garbling_shares[*out as usize],
                         self.delta,
                     )?;
                     masked_wire_values[*out as usize] = new_share;
@@ -118,16 +122,31 @@ impl Evaluator for Wrk17Evaluator {
         // wire_length - output_count ... wire_length
         let output_count: u64 = circuit.output_sizes().iter().sum();
         let wire_length: u64 = circuit.nwires();
-        // let mut res = Vec::with_capacity(output_count);
-        // for out in (wire_length - output_count)..wire_length {
-        //     self.shares[out as usize]
-        //     res.append(())
-        // }
+        let mut masked_output_values = Vec::with_capacity(output_count as usize);
+        for out in (wire_length - output_count)..wire_length {
+            masked_output_values.push(masked_wire_values[out as usize]);
+        }
 
-        todo!()
+        Ok(Wrk17EncodedOutput {
+            masked_output_values,
+        })
     }
 
-    fn decode(&self, encoded: Self::GarbledOutput, decoder: Self::Decoder) -> Vec<u8> {
+    fn decode(
+        &self,
+        encoded: Wrk17EncodedOutput,
+        decoder: Wrk17Decoder,
+    ) -> Result<Vec<u8>, GcError> {
+        for (all_shares_macs, key) in decoder.inner.into_iter().zip(&self.wire_mask_shares) {
+            for (i, (share, mac)) in all_shares_macs.into_iter().enumerate() {
+                let key = key.mac_keys[&(i as u16)];
+                if share * self.delta + key != mac {
+                    return Err(GcError::DecoderCheckFailure);
+                }
+            }
+        }
+
+        // reconstruct the shares
         todo!()
     }
 }
