@@ -40,7 +40,7 @@ where
     pub fn serialize_mac_values<W: Write>(&self, writer: &mut W) {
         // iterating is sorted by key
         for v in self.mac_values.values() {
-            writer.write(&v.to_bytes()).unwrap();
+            writer.write_all(&v.to_bytes()).unwrap();
         }
     }
 
@@ -53,7 +53,7 @@ where
             if i != self.party_id {
                 reader
                     .read_exact(&mut buf)
-                    .expect(&format!("reading failed for i={i}"));
+                    .unwrap_or_else(|_| panic!("reading failed for i={i}"));
                 self.mac_values.insert(i, MacFF::from_bytes(&buf).unwrap());
             }
         }
@@ -62,6 +62,13 @@ where
     pub fn sum_mac_keys(&self) -> MacFF {
         // Sum trait is not implemented, so we use fold
         self.mac_keys.values().fold(MacFF::ZERO, |acc, x| acc + *x)
+    }
+
+    pub fn sum_mac_values(&self) -> MacFF {
+        // Sum trait is not implemented, so we use fold
+        self.mac_values
+            .values()
+            .fold(MacFF::ZERO, |acc, x| acc + *x)
     }
 
     pub fn check_against_incoming_macs(

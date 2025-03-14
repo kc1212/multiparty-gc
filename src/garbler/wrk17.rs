@@ -82,13 +82,13 @@ impl Wrk17GarbledRow {
         let mut hasher = blake3::Hasher::new();
         assert!(row_id <= 3);
         let label_a = label_a_0
-            + if (row_id ^ 1) == 0 {
+            + if (row_id & 1) == 0 {
                 F128b::ZERO
             } else {
                 delta
             };
         let label_b = label_b_0
-            + if ((row_id >> 1) ^ 1) == 0 {
+            + if ((row_id >> 1) & 1) == 0 {
                 F128b::ZERO
             } else {
                 delta
@@ -104,14 +104,18 @@ impl Wrk17GarbledRow {
         let output_len = 1 + 128 / 8 * share.mac_keys.len() + 128 / 8;
         let mut to_encrypt = Cursor::new(Vec::<u8>::with_capacity(output_len));
         let r = share.share;
-        to_encrypt.write(&r.to_bytes()).unwrap();
+        to_encrypt.write_all(&r.to_bytes()).unwrap();
+        #[cfg(test)]
+        {
+            println!("encrypt writing MAC: {:?}", share.mac_values);
+        }
         share.serialize_mac_values(&mut to_encrypt);
 
         // L_gamma_0 xor (sum K_i[r^j]) xor r^i \Delta_i
         let label_gamma_xor_sum_key =
             label_gamma_0 + share.sum_mac_keys() + if r == F2::ZERO { F128b::ZERO } else { delta };
         to_encrypt
-            .write(&label_gamma_xor_sum_key.to_bytes())
+            .write_all(&label_gamma_xor_sum_key.to_bytes())
             .unwrap();
 
         // Expand the xof and use it as the key to encrypt the buffer `to_encrypt`
@@ -126,6 +130,80 @@ impl Wrk17GarbledRow {
                 .map(|(a, b)| a ^ b)
                 .collect(),
         }
+    }
+
+    fn decrypt_row(
+        &self,
+        label_a: F128b,
+        label_b: F128b,
+        gate_id: u64,
+        row_id: u8,
+        party_id: u16,
+        party_count: u16,
+        macs: F128b,
+    ) -> (F128b, AuthShare<F2, F128b>) {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&label_a.to_bytes());
+        hasher.update(&label_b.to_bytes());
+        hasher.update(&gate_id.to_le_bytes());
+        hasher.update(&row_id.to_le_bytes());
+        let mut xof_reader = hasher.finalize_xof();
+
+        let mut xof_buf = vec![0u8; self.inner.len()];
+        xof_reader.fill(&mut xof_buf);
+        #[cfg(test)]
+        {
+            println!(
+                "decryption len {}, xof: {}",
+                xof_buf.len(),
+                hex::encode(&xof_buf)
+            );
+        }
+
+        // G_{\gamma,\ell}^i xor H(L_a, L_b, \gamma, \ell)
+        for (b, g) in xof_buf.iter_mut().zip(&self.inner) {
+            *b ^= *g;
+        }
+
+        // In the cursor, first byte is r, then we have the MACs, finally the label
+        let mut cursor = Cursor::new(xof_buf);
+
+        // First read the byte and convert it to F2
+        let mut r_buf = [0u8; 1];
+        cursor.read_exact(&mut r_buf).unwrap();
+        let r = F2::from_bytes((&r_buf).into()).unwrap();
+
+        // Second read the MACs
+        // M_j[r^i_{\gamma, \ell}], i is fixed in every iteration, j \in [n] \ i
+        let mut r_share: AuthShare<_, F128b> = AuthShare {
+            party_id,
+            share: r,
+            mac_values: BTreeMap::new(),
+            mac_keys: BTreeMap::new(),
+        };
+        // TODO do we need to deserialize everything?
+        r_share.deserialize_mac_values(party_count, &mut cursor);
+        assert_eq!(r_share.mac_values.len(), party_count as usize - 1);
+        #[cfg(test)]
+        {
+            println!("decrypt read MAC: {:?}", r_share.mac_values);
+        }
+
+        // Next we read the encrypted label:
+        // L_\gamma^i + (sum K_i[r^j_{\gamma, \ell}]) + r^i_{\gamma, \ell} \Delta_i
+        let mut enc_label_gamma_buf =
+            GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
+        cursor.read_exact(&mut enc_label_gamma_buf).unwrap();
+
+        // Remove the mask using the MACs
+        // Decrypt it using sum_j, M_i[r^j_{\gamma, \ell}] for row \ell, j != i.
+        for (a, b) in enc_label_gamma_buf.iter_mut().zip(macs.to_bytes()) {
+            *a ^= b;
+        }
+
+        let label_gamma = F128b::from_bytes(&enc_label_gamma_buf).unwrap();
+
+        (label_gamma, r_share)
     }
 }
 
@@ -182,49 +260,21 @@ pub(crate) fn decrypt_garbled_gate(
         assert_eq!(garbled_gates[party_id].party_id as usize, party_id);
 
         // G_{\gamma,\ell}^i
-        let garbled_row = &garbled_gates[party_id][row_id].inner;
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&label_as[party_id].to_bytes());
-        hasher.update(&label_bs[party_id].to_bytes());
-        hasher.update(&gate_id.to_le_bytes());
-        hasher.update(&row_id.to_le_bytes());
-        let mut xof_reader = hasher.finalize_xof();
-
-        // H(L_a, L_b, \gamma, \ell)
-        let mut buf = vec![0u8; garbled_row.len()];
-        xof_reader.fill(&mut buf);
-
-        // G_{\gamma,\ell}^i xor H(L_a, L_b, \gamma, \ell)
-        for (b, g) in buf.iter_mut().zip(garbled_row) {
-            *b ^= *g;
-        }
-
-        // In the cursor, first byte is r, then we have the MACs, finally the label
-        let mut cursor = Cursor::new(buf);
-
-        // First read the byte and convert it to F2
-        let mut r_buf = [0u8; 1];
-        cursor.read(&mut r_buf).unwrap();
-        let r = F2::from_bytes((&r_buf).into()).unwrap();
-
-        // Second read the MACs
-        // M_j[r^i_{\gamma, \ell}], i is fixed in every iteration, j \in [n] \ i
-        let mut r_share: AuthShare<_, F128b> = AuthShare {
-            party_id: party_id as u16,
-            share: r,
-            mac_values: BTreeMap::new(),
-            mac_keys: BTreeMap::new(),
+        let garbled_row = Wrk17GarbledRow {
+            // TODO don't need to clone
+            inner: garbled_gates[party_id][row_id].inner.clone(),
         };
-        // TODO do we need to deserialize everything?
-        r_share.deserialize_mac_values(party_count as u16, &mut cursor);
-        assert_eq!(r_share.mac_values.len(), party_count - 1);
 
-        // Finally read the label: L_\gamma^i
-        let mut label_gamma_buf =
-            GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
-        cursor.read_exact(&mut label_gamma_buf).unwrap();
-        let label_gamma = F128b::from_bytes(&label_gamma_buf).unwrap();
+        let macs = todo!();
+        let (label_gamma, r_share) = garbled_row.decrypt_row(
+            label_as[party_id],
+            label_bs[party_id],
+            gate_id,
+            row_id,
+            party_id as u16,
+            party_count as u16,
+            macs,
+        );
 
         // perform mac check:
         // r^i_{\gamma, \ell} * \Delta_1 + K_1[r^i_{\gamma, \ell}] = M_1[r^i_{\gamma, \ell}]
@@ -330,10 +380,10 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
             match gate {
                 Gate::XOR { a, b, out } => {
                     let output_share = &auth_bits[a] + &auth_bits[b];
-                    assert!(auth_bits.get(out).is_none());
+                    assert!(!auth_bits.contains_key(out));
                     auth_bits.insert(*out, output_share);
                     if self.is_garbler() {
-                        assert!(wire_labels.get(out).is_none());
+                        assert!(!wire_labels.contains_key(out));
                         wire_labels.insert(*out, wire_labels[a] + wire_labels[b]);
                     }
                 }
@@ -433,12 +483,44 @@ mod tests {
         let n = 10u16;
         let secret = F2::random(&mut rng);
         let (shares, deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
-        let share = shares[0].clone();
-        let delta = deltas[0];
+        let party_id = 0;
+        // share: (r^i, {M_j[r^i], K_i[r^j]})
+        let share = shares[party_id].clone();
+        let delta = deltas[party_id];
         let label_a_0 = F128b::random(&mut rng);
         let label_b_0 = F128b::random(&mut rng);
-        let label_gamma = F128b::random(&mut rng);
-        let _row =
-            Wrk17GarbledRow::encrypt_row(&share, delta, label_a_0, label_b_0, label_gamma, 12, 0);
+        let label_gamma_0 = F128b::random(&mut rng);
+        let gate_id = 12;
+        let row = Wrk17GarbledRow::encrypt_row(
+            &share,
+            delta,
+            label_a_0,
+            label_b_0,
+            label_gamma_0,
+            gate_id,
+            0,
+        );
+
+        let macs_on_share_0 = shares
+            .iter()
+            .skip(1)
+            .map(|share| {
+                // mac held by party j on share i
+                share.mac_values[&0]
+            })
+            .sum();
+        let (recovered_label, recovered_share) = row.decrypt_row(
+            label_a_0,
+            label_b_0,
+            gate_id,
+            0,
+            party_id as u16,
+            n,
+            macs_on_share_0,
+        );
+
+        // the label we get back should be label_gamma_0
+        assert_eq!(recovered_share.mac_values, share.mac_values);
+        assert_eq!(recovered_label, label_gamma_0 + (secret * delta));
     }
 }
