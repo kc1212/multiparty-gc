@@ -22,8 +22,9 @@ pub mod sharing;
 
 #[cfg(test)]
 mod test {
+    use std::io::BufReader;
+
     use bristol_fashion::Circuit;
-    use fancy_garbling::circuit::BinaryCircuit;
     use itertools::Itertools;
     use rand::SeedableRng;
     use scuttlebutt::{AesRng, ring::FiniteRing};
@@ -31,8 +32,30 @@ mod test {
 
     use crate::{MsgRound2, MsgRound3, evaluator::Evaluator, garbler::Garbler};
 
-    fn circuit_to_binary_circuit(circuit: &Circuit) -> BinaryCircuit {
-        todo!()
+    fn eval_clear_circuit(circuit: &Circuit, inputs: Vec<u8>) -> Vec<u8> {
+        let wire_count = circuit.nwires() as usize;
+        let total_inputs: u64 = circuit.input_sizes().iter().sum();
+        assert_eq!(inputs.len() as u64, total_inputs);
+
+        let mut buffer = vec![inputs, vec![0u8; wire_count - total_inputs as usize]].concat();
+        for gate in circuit.gates() {
+            match gate {
+                bristol_fashion::Gate::XOR { a, b, out } => {
+                    buffer[*out as usize] = buffer[*a as usize] ^ buffer[*b as usize];
+                }
+                bristol_fashion::Gate::AND { a, b, out } => {
+                    buffer[*out as usize] = buffer[*a as usize] & buffer[*b as usize];
+                }
+                bristol_fashion::Gate::INV { a, out } => {
+                    buffer[*out as usize] = buffer[*a as usize] ^ 1;
+                }
+                bristol_fashion::Gate::EQ { lit: _, out: _ } => unimplemented!(),
+                bristol_fashion::Gate::EQW { a: _, out: _ } => unimplemented!(),
+            }
+        }
+
+        let output_len: u64 = circuit.output_sizes().iter().sum();
+        buffer.split_off(wire_count - output_len as usize)
     }
 
     fn generic_framework<G: Garbler, E: Evaluator<Gc = G::Gc, Label = F128b>>(
@@ -77,21 +100,25 @@ mod test {
         let decoder = todo!();
         let final_result = evaluator.decode(encoded_output, decoder).unwrap();
 
-        use fancy_garbling::circuit::eval_plain;
         let plain_eval_inputs = true_inputs
             .iter()
-            .map(|x| if *x == F2::ZERO { 0u16 } else { 1u16 })
+            .map(|x| if *x == F2::ZERO { 0u8 } else { 1u8 })
             .collect_vec();
-        let expected_result = eval_plain(
-            &circuit_to_binary_circuit(&circuit),
-            &[],
-            &plain_eval_inputs,
-        )
-        .unwrap()
-        .into_iter()
-        .map(|x| x as u8)
-        .collect_vec();
+        let expected_result = eval_clear_circuit(&circuit, plain_eval_inputs)
+            .into_iter()
+            .map(|x| x as u8)
+            .collect_vec();
 
         assert_eq!(final_result, expected_result)
+    }
+
+    #[test]
+    fn test_clear_circuit() {
+        let f = std::fs::File::open("circuits/and.txt").unwrap();
+        let buf_reader = BufReader::new(f);
+        let circuit = bristol_fashion::read(buf_reader).unwrap();
+        assert_eq!(1, circuit.output_sizes().len());
+        assert_eq!(1, circuit.output_sizes()[0]);
+        assert_eq!(eval_clear_circuit(&circuit, vec![1, 1]), vec![1]);
     }
 }

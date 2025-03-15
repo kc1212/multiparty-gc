@@ -16,4 +16,3 @@ generic-array = "1.1.1"
 
 [dev-dependencies]
 hex = "0.4.3"
-fancy-garbling = { git = "https://github.com/GaloisInc/swanky", rev = "cd3862a" }
