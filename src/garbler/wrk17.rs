@@ -336,10 +336,9 @@ pub(crate) fn decrypt_garbled_gate(
 }
 
 pub struct Wrk17EvaluatorOutput {
-    garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
-    // TODO we can just use a Vec here, only need the final shares for the output wires
-    wire_mask_shares: BTreeMap<u64, AuthShare<F2, F128b>>,
-    delta: F128b,
+    pub(crate) garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
+    pub(crate) wire_mask_shares: Vec<AuthShare<F2, F128b>>,
+    pub(crate) delta: F128b,
 }
 
 pub enum Wrk17Garbling {
@@ -375,6 +374,7 @@ pub struct Wrk17MsgRound1 {
 
 impl MsgRound1 for Wrk17MsgRound1 {}
 
+#[derive(Clone)]
 pub struct Wrk17MsgRound2 {
     masked_inputs: Vec<F2>,
 }
@@ -395,7 +395,8 @@ impl MsgRound3 for Wrk17MsgRound3 {
     }
 }
 
-impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
+impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
+    type Gc = Wrk17Garbling;
     type MR1 = Wrk17MsgRound1;
     type MR2 = Wrk17MsgRound2;
     type MR3 = Wrk17MsgRound3;
@@ -529,12 +530,18 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
             }
         }
 
+        // prepare the actual garbled circuit
         if self.is_garbler() {
             Wrk17Garbling::Garbler(garbler_output)
         } else {
+            let output_wire_count: u64 = circuit.output_sizes().iter().sum();
+            let nwires = circuit.nwires();
+            debug_assert_eq!(nwires as usize, auth_bits.len());
             Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
                 garbling_shares: eval_output,
-                wire_mask_shares: auth_bits,
+                wire_mask_shares: (nwires - output_wire_count..nwires)
+                    .map(|i| auth_bits[&i].clone())
+                    .collect(),
                 delta,
             })
         }

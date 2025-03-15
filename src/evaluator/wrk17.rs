@@ -5,7 +5,7 @@ use swanky_field_binary::{F2, F128b};
 
 use crate::{
     error::GcError,
-    garbler::wrk17::{Wrk17Garbling, decrypt_garbled_gate},
+    garbler::wrk17::{Wrk17EvaluatorOutput, Wrk17Garbling, decrypt_garbled_gate},
     sharing::AuthShare,
 };
 
@@ -34,10 +34,23 @@ pub struct Wrk17Decoder {
 
 impl Evaluator for Wrk17Evaluator {
     type Gc = Wrk17Garbling;
-    type Input = F2;
     type Label = F128b;
     type GarbledOutput = Wrk17EncodedOutput;
     type Decoder = Wrk17Decoder;
+
+    fn from_garbling(garbling: Wrk17Garbling) -> Self {
+        let Wrk17EvaluatorOutput {
+            garbling_shares,
+            wire_mask_shares,
+            delta,
+        } = garbling.get_evaluator_gates();
+
+        Self {
+            garbling_shares,
+            wire_mask_shares,
+            delta,
+        }
+    }
 
     /// `input_labels` - input_labels[i][j] means party i wire j
     fn eval(
