@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use bristol_fashion::{Circuit, Gate};
 use itertools::Itertools;
 use scuttlebutt::ring::FiniteRing;
@@ -13,7 +11,7 @@ use crate::{
 
 use super::Evaluator;
 
-struct Wrk17Evaluator {
+pub struct Wrk17Evaluator {
     /// Ordererd by topological order of AND gate
     /// r^1_{\gamma, \ell}, {M_j[r^1_{\gamma, \ell}]}, {K_1[r^j_{\gamma, \ell}]}
     garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
@@ -23,11 +21,11 @@ struct Wrk17Evaluator {
     delta: F128b,
 }
 
-struct Wrk17EncodedOutput {
+pub struct Wrk17EncodedOutput {
     masked_output_values: Vec<F2>,
 }
 
-struct Wrk17Decoder {
+pub struct Wrk17Decoder {
     // To decode, each party needs to send
     // { (r^i_w, M_1[r^i_w]) } to the evaluator
     // inner[i][j] is the ith wire and jth party
@@ -35,7 +33,7 @@ struct Wrk17Decoder {
 }
 
 impl Evaluator for Wrk17Evaluator {
-    type G = Wrk17Garbling;
+    type Gc = Wrk17Garbling;
     type Input = F2;
     type Label = F128b;
     type GarbledOutput = Wrk17EncodedOutput;

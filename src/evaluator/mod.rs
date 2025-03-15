@@ -1,12 +1,12 @@
 use bristol_fashion::Circuit;
 use scuttlebutt::field::FiniteField;
 
-use crate::{error::GcError, garbler::Garbling};
+use crate::{MsgRound1, MsgRound2, error::GcError, garbler::Garbling};
 
-mod wrk17;
+pub mod wrk17;
 
-trait Evaluator {
-    type G: Garbling;
+pub trait Evaluator {
+    type Gc: Garbling;
     type Input: FiniteField;
     type Label: FiniteField;
     type GarbledOutput;
@@ -15,7 +15,7 @@ trait Evaluator {
     fn eval(
         &self,
         circuit: &Circuit,
-        garblings: Vec<Self::G>,
+        garblings: Vec<Self::Gc>,
         masked_inputs: Vec<Self::Input>,
         input_labels: Vec<Vec<Self::Label>>,
     ) -> Result<Self::GarbledOutput, GcError>;
@@ -25,4 +25,6 @@ trait Evaluator {
         encoded: Self::GarbledOutput,
         decoder: Self::Decoder,
     ) -> Result<Vec<u8>, GcError>;
+
+    // fn input_round_2(&self, msg: Self::MR1) -> Self::MR2;
 }

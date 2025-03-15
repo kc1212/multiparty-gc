@@ -6,12 +6,15 @@ use std::{
 
 use bristol_fashion::{Circuit, Gate};
 use generic_array::GenericArray;
+use itertools::izip;
 use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
 use scuttlebutt::serialization::CanonicalSerialize;
 use swanky_field_binary::{F2, F128b};
 
-use crate::{error::GcError, prep::Preprocessor, sharing::AuthShare};
+use crate::{
+    MsgRound1, MsgRound2, MsgRound3, error::GcError, prep::Preprocessor, sharing::AuthShare,
+};
 
 use super::{Garbler, Garbling};
 
@@ -21,6 +24,14 @@ pub struct Wrk17Garbler<P: Preprocessor> {
     party_id: u16,
     total_num_parties: u16,
     preprocessor: P,
+
+    // These are only inputs for party 1
+    delta: F128b,
+    input_shares: Vec<F2>,
+    input_macs: Vec<F128b>,
+    input_labels: Vec<F128b>,
+    // Only filled for the evaluator
+    input_keys: Vec<F128b>,
 }
 
 impl<P: Preprocessor> Wrk17Garbler<P> {
@@ -339,17 +350,7 @@ pub enum Wrk17Garbling {
     Evaluator(Wrk17EvaluatorOutput),
 }
 
-impl Garbling for Wrk17Garbling {
-    // type GarbledGate = Wrk17GarbledGate;
-
-    // fn push_gate(&mut self, garbled_gate: Self::GarbledGate) {
-    //     self.gates.push(garbled_gate);
-    // }
-
-    // fn read_gate(&self, i: usize) -> &Self::GarbledGate {
-    //     &self.gates[i]
-    // }
-}
+impl Garbling for Wrk17Garbling {}
 
 impl Wrk17Garbling {
     pub fn get_garbler_gates(self) -> Vec<Wrk17GarbledGate> {
@@ -367,7 +368,38 @@ impl Wrk17Garbling {
     }
 }
 
+pub struct Wrk17MsgRound1 {
+    shares: Vec<F2>,
+    macs: Vec<F128b>,
+}
+
+impl MsgRound1 for Wrk17MsgRound1 {}
+
+pub struct Wrk17MsgRound2 {
+    masked_inputs: Vec<F2>,
+}
+
+impl MsgRound2 for Wrk17MsgRound2 {
+    fn into_masked_inputs(self) -> Vec<F2> {
+        self.masked_inputs
+    }
+}
+
+pub struct Wrk17MsgRound3 {
+    labels: Vec<F128b>,
+}
+
+impl MsgRound3 for Wrk17MsgRound3 {
+    fn into_labels(self) -> Vec<F128b> {
+        self.labels
+    }
+}
+
 impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
+    type MR1 = Wrk17MsgRound1;
+    type MR2 = Wrk17MsgRound2;
+    type MR3 = Wrk17MsgRound3;
+
     fn party_id(&self) -> u16 {
         self.party_id
     }
@@ -478,6 +510,25 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
                 bristol_fashion::Gate::EQW { a: _, out: _ } => todo!(),
             }
         }
+
+        // keep some information that we need for inputs
+        let input_len: u64 = circuit.input_sizes().iter().sum();
+        self.delta = delta;
+        for input_idx in 0..input_len {
+            if !self.is_garbler() {
+                self.input_keys
+                    .push(auth_bits[&input_idx].mac_keys[&(&self.total_num_parties - 1)]);
+            } else {
+                let r = auth_bits[&input_idx].share;
+                let mac = auth_bits[&input_idx].mac_values[&(&self.total_num_parties - 1)];
+                self.input_shares.push(r);
+                self.input_macs.push(mac);
+
+                let label = wire_labels[&input_idx];
+                self.input_labels.push(label);
+            }
+        }
+
         if self.is_garbler() {
             Wrk17Garbling::Garbler(garbler_output)
         } else {
@@ -487,6 +538,65 @@ impl<P: Preprocessor> Garbler<Wrk17Garbling> for Wrk17Garbler<P> {
                 delta,
             })
         }
+    }
+
+    fn input_round_1(&self) -> Wrk17MsgRound1 {
+        // Only the garbler can all this function
+        assert!(self.party_id != self.total_num_parties - 1);
+
+        Wrk17MsgRound1 {
+            shares: self.input_shares.clone(),
+            macs: self.input_macs.clone(),
+        }
+    }
+
+    fn input_round_2(
+        &self,
+        true_inputs: Vec<F2>,
+        msgs: Vec<Wrk17MsgRound1>,
+    ) -> Result<Vec<Wrk17MsgRound2>, GcError> {
+        debug_assert_eq!(self.party_id, self.total_num_parties - 1);
+
+        // The evaluator receives r^i_w, M_1[r^i_w]
+        // so we find the corresponding MAC key and do a MAC check.
+        // Also reconstruct at the same time.
+        let mut output = true_inputs;
+        for Wrk17MsgRound1 { macs, shares } in msgs {
+            debug_assert_eq!(macs.len(), shares.len());
+            debug_assert_eq!(macs.len(), self.input_keys.len());
+            debug_assert_eq!(macs.len(), output.len());
+            // get the mac keys that I have
+            for (w, (share, mac, key)) in izip!(shares, macs, &self.input_keys).enumerate() {
+                if share * self.delta + *key != mac {
+                    return Err(GcError::InputRound2CheckFailure);
+                }
+                output[w] += share;
+            }
+        }
+
+        Ok((0..self.total_num_parties)
+            .map(|_| Wrk17MsgRound2 {
+                masked_inputs: output.clone(),
+            })
+            .collect())
+    }
+
+    /// We receive the masked input x^1_w + \lambda_w,
+    /// then output the correct mask according to the masked input.
+    fn input_round_3(&self, msg: Wrk17MsgRound2) -> Wrk17MsgRound3 {
+        // Only the garbler can all this function
+        assert!(self.party_id != self.total_num_parties - 1);
+
+        let mut output = Vec::with_capacity(msg.masked_inputs.len());
+        assert_eq!(msg.masked_inputs.len(), self.input_labels.len());
+        for (label, masked_value) in self.input_labels.iter().zip(msg.masked_inputs) {
+            if masked_value == F2::ZERO {
+                output.push(*label);
+            } else {
+                output.push(*label + self.delta);
+            }
+        }
+        Wrk17MsgRound3 { labels: output }
     }
 }
 

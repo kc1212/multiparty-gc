@@ -12,6 +12,7 @@ use crate::sharing::AuthShare;
 /// if this function is called in the same order
 /// by all parties.
 pub trait StaticPreprocessor {
+    fn party_count(&self) -> u16;
     fn init_delta(&mut self) -> F128b;
     fn auth_random(&mut self, m: u64) -> Vec<AuthShare<F2, F128b>>;
     fn auth_mul(

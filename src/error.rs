@@ -6,4 +6,6 @@ pub enum GcError {
     MacCheckFailure,
     #[error("Decoder MAC check failure")]
     DecoderCheckFailure,
+    #[error("Input round 2 MAC check failure")]
+    InputRound2CheckFailure,
 }
