@@ -132,7 +132,7 @@ impl Wrk17GarbledRow {
         }
     }
 
-    fn decrypt_row(
+    fn extract_macs_and_label_gamma(
         &self,
         label_a: F128b,
         label_b: F128b,
@@ -140,8 +140,10 @@ impl Wrk17GarbledRow {
         row_id: u8,
         party_id: u16,
         party_count: u16,
-        macs: F128b,
-    ) -> (F128b, AuthShare<F2, F128b>) {
+    ) -> (
+        GenericArray<u8, <F128b as CanonicalSerialize>::ByteReprLen>,
+        AuthShare<F2, F128b>,
+    ) {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&label_a.to_bytes());
         hasher.update(&label_b.to_bytes());
@@ -194,16 +196,21 @@ impl Wrk17GarbledRow {
         let mut enc_label_gamma_buf =
             GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
         cursor.read_exact(&mut enc_label_gamma_buf).unwrap();
+        (enc_label_gamma_buf, r_share)
+    }
 
+    fn decrypt_label_gamma(
+        enc_label_gamma: &mut GenericArray<u8, <F128b as CanonicalSerialize>::ByteReprLen>,
+        macs: F128b,
+    ) -> F128b {
         // Remove the mask using the MACs
         // Decrypt it using sum_j, M_i[r^j_{\gamma, \ell}] for row \ell, j != i.
-        for (a, b) in enc_label_gamma_buf.iter_mut().zip(macs.to_bytes()) {
+        for (a, b) in enc_label_gamma.iter_mut().zip(macs.to_bytes()) {
             *a ^= b;
         }
 
-        let label_gamma = F128b::from_bytes(&enc_label_gamma_buf).unwrap();
-
-        (label_gamma, r_share)
+        let label_gamma = F128b::from_bytes(enc_label_gamma).unwrap();
+        label_gamma
     }
 }
 
@@ -250,13 +257,14 @@ pub(crate) fn decrypt_garbled_gate(
         (false, true) => 1,
         (false, false) => 0u8,
     };
-    assert_eq!(garbled_gates.len(), label_as.len());
-    assert_eq!(garbled_gates.len(), label_bs.len());
     let party_count = garbled_gates.len() + 1;
+    assert_eq!(party_count - 1, label_as.len());
+    assert_eq!(party_count - 1, label_bs.len());
     let evaluator_index = party_count as u16 - 1;
-    let mut output_share = F2::ZERO;
-    let mut output_label = vec![F128b::ZERO; party_count - 1];
-    for party_id in 0..garbled_gates.len() {
+
+    let mut r_shares = Vec::with_capacity(party_count - 1);
+    let mut enc_label_gammas = Vec::with_capacity(party_count - 1);
+    for party_id in 0..party_count - 1 {
         assert_eq!(garbled_gates[party_id].party_id as usize, party_id);
 
         // G_{\gamma,\ell}^i
@@ -265,15 +273,13 @@ pub(crate) fn decrypt_garbled_gate(
             inner: garbled_gates[party_id][row_id].inner.clone(),
         };
 
-        let macs = todo!();
-        let (label_gamma, r_share) = garbled_row.decrypt_row(
+        let (enc_label_gamma, r_share) = garbled_row.extract_macs_and_label_gamma(
             label_as[party_id],
             label_bs[party_id],
             gate_id,
             row_id,
             party_id as u16,
             party_count as u16,
-            macs,
         );
 
         // perform mac check:
@@ -286,17 +292,32 @@ pub(crate) fn decrypt_garbled_gate(
             return Err(GcError::MacCheckFailure);
         }
 
+        enc_label_gammas.push(enc_label_gamma);
+        r_shares.push(r_share);
+    }
+
+    let mut output_share = F2::ZERO;
+    let mut output_label = vec![F128b::ZERO; party_count - 1];
+    for (party_id, enc_label_gamma) in enc_label_gammas.iter_mut().enumerate() {
+        // We need to decrypt the labels, for this we need MACs of the form
+        // M_i[r^j_{\gamma, \ell}]
+
+        let macs = (0..party_count - 1)
+            .map(|i| r_shares[i].mac_values[&(party_id as u16)])
+            .fold(F128b::ZERO, |acc, x| acc + x);
+        let recovered_label = Wrk17GarbledRow::decrypt_label_gamma(enc_label_gamma, macs);
+
         // \sum r^i_{\gamma, \ell} = z_\gamma + \lambda_\gamma
-        output_share += r_share.share;
+        output_share += r_shares[party_id].share;
 
         // If the labels start as zero, first set the labels to be
         // [L^0, L^1, ..., L^{n-1}]
         // Then we need to xor each label L^i with \sum_j M_i[r^j_{\gamma, \ell}]
         // But we're given M_j[r^i_{\gamma, \ell}] (note i and j are reversed)
         // So we iterate over j and add the MACs to each L^i.
-        output_label[party_id] += label_gamma;
-        for (k, v) in r_share.mac_values {
-            output_label[k as usize] += v;
+        output_label[party_id] += recovered_label;
+        for (k, v) in &r_shares[party_id].mac_values {
+            output_label[*k as usize] += v;
         }
     }
 
@@ -501,6 +522,9 @@ mod tests {
             0,
         );
 
+        let (mut enc_label, recovered_share) =
+            row.extract_macs_and_label_gamma(label_a_0, label_b_0, gate_id, 0, party_id as u16, n);
+
         let macs_on_share_0 = shares
             .iter()
             .skip(1)
@@ -509,15 +533,8 @@ mod tests {
                 share.mac_values[&0]
             })
             .sum();
-        let (recovered_label, recovered_share) = row.decrypt_row(
-            label_a_0,
-            label_b_0,
-            gate_id,
-            0,
-            party_id as u16,
-            n,
-            macs_on_share_0,
-        );
+
+        let recovered_label = Wrk17GarbledRow::decrypt_label_gamma(&mut enc_label, macs_on_share_0);
 
         // the label we get back should be label_gamma_0
         assert_eq!(recovered_share.mac_values, share.mac_values);

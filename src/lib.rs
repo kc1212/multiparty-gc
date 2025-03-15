@@ -7,5 +7,6 @@ pub trait GcPrf {
 pub mod error;
 pub mod evaluator;
 pub mod garbler;
+pub mod input;
 pub mod prep;
 pub mod sharing;
