@@ -29,7 +29,7 @@ mod test {
     use bristol_fashion::Circuit;
     use itertools::Itertools;
     use rand::SeedableRng;
-    use scuttlebutt::{AesRng, ring::FiniteRing};
+    use scuttlebutt::{AesRng, ring::FiniteRing, serialization::CanonicalSerialize};
     use swanky_field_binary::{F2, F128b};
 
     use crate::{
@@ -117,6 +117,7 @@ mod test {
             .collect_vec();
         let expected_result = eval_clear_circuit(circuit, plain_eval_inputs)
             .into_iter()
+            .map(|x| F2::from_bytes(&[x].into()).unwrap())
             .collect_vec();
 
         assert_eq!(final_result, expected_result)

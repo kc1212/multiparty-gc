@@ -1,5 +1,5 @@
 use bristol_fashion::{Circuit, Gate};
-use itertools::Itertools;
+use itertools::{Itertools, izip};
 use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
 
@@ -12,6 +12,7 @@ use crate::{
 use super::Evaluator;
 
 pub struct Wrk17Evaluator {
+    total_num_parties: u16,
     /// Ordererd by topological order of AND gate
     /// r^1_{\gamma, \ell}, {M_j[r^1_{\gamma, \ell}]}, {K_1[r^j_{\gamma, \ell}]}
     garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
@@ -37,12 +38,14 @@ impl Evaluator for Wrk17Evaluator {
 
     fn from_garbling(garbling: Wrk17Garbling) -> Self {
         let Wrk17EvaluatorOutput {
+            total_num_parties,
             garbling_shares,
             wire_mask_shares,
             delta,
         } = garbling.get_evaluator_gates();
 
         Self {
+            total_num_parties,
             garbling_shares,
             wire_mask_shares,
             delta,
@@ -63,7 +66,10 @@ impl Evaluator for Wrk17Evaluator {
         let gate_count = circuit.gates().len();
         assert_eq!(input_len as usize, masked_inputs.len());
         assert_eq!(party_count - 1, input_labels.len());
+
+        // Note that input length + gate_count is the wire count
         let mut masked_wire_values = [masked_inputs, vec![F2::ZERO; gate_count]].concat();
+        debug_assert_eq!(masked_wire_values.len() as u64, circuit.nwires());
 
         // TODO avoid these transposes
         // labels[i][j] means the label on wire i and party j,
@@ -111,11 +117,10 @@ impl Evaluator for Wrk17Evaluator {
                         self.delta,
                     )?;
                     masked_wire_values[*out as usize] = new_share;
-                    #[cfg(test)]
-                    {
-                        assert_eq!(labels[*out as usize].len(), new_labels.len());
-                        assert!(labels[*out as usize].iter().all(|x| *x == F128b::ZERO));
-                    }
+
+                    debug_assert_eq!(labels[*out as usize].len(), new_labels.len());
+                    debug_assert!(labels[*out as usize].iter().all(|x| *x == F128b::ZERO));
+
                     labels[*out as usize] = new_labels;
                     and_gate_ctr += 1;
                 }
@@ -129,9 +134,9 @@ impl Evaluator for Wrk17Evaluator {
         // In bristol fashion, the output wires have numbers from
         // wire_length - output_count ... wire_length
         let output_count: u64 = circuit.output_sizes().iter().sum();
-        let wire_length: u64 = circuit.nwires();
+        let wire_count: u64 = circuit.nwires();
         let mut masked_output_values = Vec::with_capacity(output_count as usize);
-        for out in (wire_length - output_count)..wire_length {
+        for out in (wire_count - output_count)..wire_count {
             masked_output_values.push(masked_wire_values[out as usize]);
         }
 
@@ -140,22 +145,66 @@ impl Evaluator for Wrk17Evaluator {
         })
     }
 
+    /// - `decoder`: decoder[i][w] where i is the party and w is the wire
     fn decode(
         &self,
         encoded: Wrk17EncodedOutput,
         decoder: Vec<Vec<(F2, F128b)>>,
-    ) -> Result<Vec<u8>, GcError> {
-        for (all_shares_macs, key) in decoder.into_iter().zip(&self.wire_mask_shares) {
-            for (i, (share, mac)) in all_shares_macs.into_iter().enumerate() {
+    ) -> Result<Vec<F2>, GcError> {
+        if decoder.len() != self.total_num_parties as usize - 1 {
+            eprintln!("decoder.len != total_num_parties - 1");
+            return Err(GcError::DecoderLengthError);
+        }
+        if encoded.masked_output_values.len() != decoder[0].len() {
+            eprintln!("masked_output_values.len != decoder[0].len()");
+            return Err(GcError::DecoderLengthError);
+        }
+        if encoded.masked_output_values.len() != self.wire_mask_shares.len() {
+            eprintln!("masked_output_values.len != wire_mask_shares.len()");
+            return Err(GcError::DecoderLengthError);
+        }
+
+        let mut _check_count = 0;
+        for (all_shares_macs, key) in decoder.iter().zip(&self.wire_mask_shares) {
+            for (i, (share, mac)) in all_shares_macs.iter().enumerate() {
                 let key = key.mac_keys[&(i as u16)];
-                if share * self.delta + key != mac {
+                if *share * self.delta + key != *mac {
                     return Err(GcError::DecoderCheckFailure);
+                }
+                #[cfg(test)]
+                {
+                    _check_count += 1usize;
                 }
             }
         }
+        #[cfg(test)]
+        {
+            println!("{_check_count} decoder checks passed");
+        }
 
-        // reconstruct the shares
-        todo!()
+        let decoder = transpose(decoder);
+        assert_eq!(decoder.len(), encoded.masked_output_values.len());
+
+        // reconstruct the shares, note that we need all shares
+        let res = izip!(
+            encoded.masked_output_values,
+            decoder,
+            &self.wire_mask_shares
+        )
+        .map(|(masked_output, mask_shares, evaluator_share)| {
+            let mask = mask_shares
+                .into_iter()
+                .map(|inner| inner.0)
+                .fold(F2::ZERO, |acc, x| acc + x)
+                + evaluator_share.share;
+            #[cfg(test)]
+            {
+                println!("reconstructed output mask: {mask:?}");
+            }
+            masked_output + mask
+        })
+        .collect_vec();
+        Ok(res)
     }
 }
 

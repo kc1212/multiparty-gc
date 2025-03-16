@@ -88,6 +88,10 @@ impl InsecureCircuitPreprocessor {
                 bristol_fashion::Gate::AND { a, b, out } => {
                     // generate the auth bit
                     let secret = F2::random(rng);
+                    #[cfg(test)]
+                    {
+                        println!("secret for auth bit: {secret:?}");
+                    }
                     for (party_id, auth_share) in secret_share_with_delta(secret, &deltas, rng)
                         .into_iter()
                         .enumerate()

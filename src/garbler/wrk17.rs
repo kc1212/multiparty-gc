@@ -112,13 +112,13 @@ impl Wrk17GarbledRow {
         let mut hasher = blake3::Hasher::new();
         assert!(row_id <= 3);
         let label_a = label_a_0
-            + if (row_id & 1) == 0 {
+            + if ((row_id >> 1) & 1) == 0 {
                 F128b::ZERO
             } else {
                 delta
             };
         let label_b = label_b_0
-            + if ((row_id >> 1) & 1) == 0 {
+            + if (row_id & 1) == 0 {
                 F128b::ZERO
             } else {
                 delta
@@ -135,10 +135,6 @@ impl Wrk17GarbledRow {
         let mut to_encrypt = Cursor::new(Vec::<u8>::with_capacity(output_len));
         let r = share.share;
         to_encrypt.write_all(&r.to_bytes()).unwrap();
-        #[cfg(test)]
-        {
-            println!("encrypt writing MAC: {:?}", share.mac_values);
-        }
         share.serialize_mac_values(&mut to_encrypt);
 
         // L_gamma_0 xor (sum K_i[r^j]) xor r^i \Delta_i
@@ -183,14 +179,6 @@ impl Wrk17GarbledRow {
 
         let mut xof_buf = vec![0u8; self.inner.len()];
         xof_reader.fill(&mut xof_buf);
-        #[cfg(test)]
-        {
-            println!(
-                "decryption len {}, xof: {}",
-                xof_buf.len(),
-                hex::encode(&xof_buf)
-            );
-        }
 
         // G_{\gamma,\ell}^i xor H(L_a, L_b, \gamma, \ell)
         for (b, g) in xof_buf.iter_mut().zip(&self.inner) {
@@ -216,10 +204,6 @@ impl Wrk17GarbledRow {
         // TODO do we need to deserialize everything?
         r_share.deserialize_mac_values(party_count, &mut cursor);
         assert_eq!(r_share.mac_values.len(), party_count as usize - 1);
-        #[cfg(test)]
-        {
-            println!("decrypt read MAC: {:?}", r_share.mac_values);
-        }
 
         // Next we read the encrypted label:
         // L_\gamma^i + (sum K_i[r^j_{\gamma, \ell}]) + r^i_{\gamma, \ell} \Delta_i
@@ -280,11 +264,10 @@ pub(crate) fn decrypt_garbled_gate(
 ) -> Result<(F2, Vec<F128b>), GcError> {
     // first get the row that we want to decrypt
     // row_id is \ell
-    // TODO check order
     let row_id = match (<bool as From<F2>>::from(b), <bool as From<F2>>::from(a)) {
         (true, true) => 3,
-        (true, false) => 2,
-        (false, true) => 1,
+        (false, true) => 2,
+        (true, false) => 1,
         (false, false) => 0u8,
     };
     let party_count = garbled_gates.len() + 1;
@@ -326,35 +309,35 @@ pub(crate) fn decrypt_garbled_gate(
         r_shares.push(r_share);
     }
 
-    let mut output_share = F2::ZERO;
+    let mut output_mask = F2::ZERO;
     let mut output_label = vec![F128b::ZERO; party_count - 1];
     for (party_id, enc_label_gamma) in enc_label_gammas.iter_mut().enumerate() {
         // We need to decrypt the labels, for this we need MACs of the form
-        // M_i[r^j_{\gamma, \ell}]
-
+        // sum_j M_i[r^j_{\gamma, \ell}] for j != i
         let macs = (0..party_count - 1)
+            .filter(|i| *i != party_id)
             .map(|i| r_shares[i].mac_values[&(party_id as u16)])
             .fold(F128b::ZERO, |acc, x| acc + x);
+
+        // Decrypt using the sum of MACs
         let recovered_label = Wrk17GarbledRow::decrypt_label_gamma(enc_label_gamma, macs);
 
         // \sum r^i_{\gamma, \ell} = z_\gamma + \lambda_\gamma
-        output_share += r_shares[party_id].share;
+        output_mask += r_shares[party_id].share;
 
-        // If the labels start as zero, first set the labels to be
-        // [L^0, L^1, ..., L^{n-1}]
-        // Then we need to xor each label L^i with \sum_j M_i[r^j_{\gamma, \ell}]
-        // But we're given M_j[r^i_{\gamma, \ell}] (note i and j are reversed)
-        // So we iterate over j and add the MACs to each L^i.
-        output_label[party_id] += recovered_label;
-        for (k, v) in &r_shares[party_id].mac_values {
-            output_label[*k as usize] += v;
-        }
+        // L^i_{\gamma, z_\gamma + \lambda_\gamma}
+        output_label[party_id] = recovered_label;
     }
 
-    Ok((output_share, output_label))
+    // The output_mask is a sum of shares of all parties
+    // we're still missing one from the evaluator from the above loop, so add it here
+    output_mask += evaluator_shares[row_id as usize].share;
+
+    Ok((output_mask, output_label))
 }
 
 pub struct Wrk17EvaluatorOutput {
+    pub(crate) total_num_parties: u16,
     pub(crate) garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
     pub(crate) wire_mask_shares: Vec<AuthShare<F2, F128b>>,
     pub(crate) delta: F128b,
@@ -466,12 +449,18 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 Gate::AND { a, b, out } => {
                     // we assume the and triples come in topological order
                     let auth_prod = auth_prods.pop().unwrap();
+                    // a = 0, b = 0: \lambda_a \lambda_b + \lambda_\gamma
                     let share0 = &auth_prod + &auth_bits[out];
+                    // a = 0, b = 1: \lambda_a + \lambda_a \lambda_b + \lambda_\gamma
                     let share1 = &share0 + &auth_bits[a];
+                    // a = 1, b = 0: \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
                     let share2 = &share0 + &auth_bits[b];
+                    // a = 1, b = 1: 1 + \lambda_a + \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
                     let share3 = if self.is_garbler() {
                         let mut tmp = &share1 + &auth_bits[b];
-                        tmp.mac_keys.get_mut(&0).map(|x| *x += delta);
+                        *tmp.mac_keys
+                            .get_mut(&(&self.total_num_parties - 1))
+                            .unwrap() += delta;
                         tmp
                     } else {
                         let mut tmp = &share1 + &auth_bits[b];
@@ -581,6 +570,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         } else {
             debug_assert_eq!(nwires as usize, auth_bits.len());
             Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
+                total_num_parties: self.total_num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
                     .map(|i| auth_bits[&i].clone())
