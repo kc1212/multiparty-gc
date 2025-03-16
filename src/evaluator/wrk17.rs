@@ -25,18 +25,15 @@ pub struct Wrk17EncodedOutput {
     masked_output_values: Vec<F2>,
 }
 
-pub struct Wrk17Decoder {
-    // To decode, each party needs to send
-    // { (r^i_w, M_1[r^i_w]) } to the evaluator
-    // inner[i][j] is the ith wire and jth party
-    inner: Vec<Vec<(F2, F128b)>>,
-}
-
 impl Evaluator for Wrk17Evaluator {
     type Gc = Wrk17Garbling;
     type Label = F128b;
     type GarbledOutput = Wrk17EncodedOutput;
-    type Decoder = Wrk17Decoder;
+
+    // To decode, each party needs to send
+    // { (r^i_w, M_1[r^i_w]) } to the evaluator
+    // inner[i][j] is the ith wire and jth party
+    type Decoder = Vec<(F2, F128b)>;
 
     fn from_garbling(garbling: Wrk17Garbling) -> Self {
         let Wrk17EvaluatorOutput {
@@ -74,7 +71,7 @@ impl Evaluator for Wrk17Evaluator {
         let mut labels: Vec<Vec<F128b>> = transpose(
             input_labels
                 .into_iter()
-                .map(|labels| vec![labels, vec![F128b::ZERO; gate_count]].concat())
+                .map(|labels| [labels, vec![F128b::ZERO; gate_count]].concat())
                 .collect(),
         );
 
@@ -146,9 +143,9 @@ impl Evaluator for Wrk17Evaluator {
     fn decode(
         &self,
         encoded: Wrk17EncodedOutput,
-        decoder: Wrk17Decoder,
+        decoder: Vec<Vec<(F2, F128b)>>,
     ) -> Result<Vec<u8>, GcError> {
-        for (all_shares_macs, key) in decoder.inner.into_iter().zip(&self.wire_mask_shares) {
+        for (all_shares_macs, key) in decoder.into_iter().zip(&self.wire_mask_shares) {
             for (i, (share, mac)) in all_shares_macs.into_iter().enumerate() {
                 let key = key.mac_keys[&(i as u16)];
                 if share * self.delta + key != mac {

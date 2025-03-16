@@ -129,17 +129,18 @@ macro_rules! impl_add {
 impl_add!(AuthShare<ShareFF, MacFF>);
 impl_add!(&AuthShare<ShareFF, MacFF>);
 
-pub fn secret_share<ShareFF, MacFF, R>(
+pub fn secret_share_with_delta<ShareFF, MacFF, R>(
     secret: ShareFF,
-    n: u16,
+    deltas: &[MacFF],
     rng: &mut R,
-) -> (Vec<AuthShare<ShareFF, MacFF>>, Vec<MacFF>)
+) -> Vec<AuthShare<ShareFF, MacFF>>
 where
     ShareFF: FiniteField,
     MacFF: FiniteField,
     ShareFF: IsSubFieldOf<MacFF>,
     R: Rng + CryptoRng,
 {
+    let n = deltas.len() as u16;
     assert!(n > 0);
     let mut shares = (0..n).map(|_| ShareFF::random(rng)).collect_vec();
 
@@ -147,9 +148,6 @@ where
     let sum_shares = shares.iter().fold(ShareFF::ZERO, |acc, x| acc + *x);
     // Correct the first share so that the sum of shares is the secret
     shares[0] = shares[0] + secret - sum_shares;
-
-    // Generate the global Deltas
-    let deltas = (0..n).map(|_| MacFF::random(rng)).collect_vec();
 
     // all the mac keys, ordered by party
     let mut mac_keys = Vec::with_capacity((n * n) as usize);
@@ -178,17 +176,30 @@ where
     }
 
     // assemble everything together
-    (
-        izip!(0..n, shares, mac_values, mac_keys)
-            .map(|(i, share, mac, key)| AuthShare {
-                party_id: i,
-                share,
-                mac_values: mac,
-                mac_keys: key,
-            })
-            .collect(),
-        deltas,
-    )
+    izip!(0..n, shares, mac_values, mac_keys)
+        .map(|(i, share, mac, key)| AuthShare {
+            party_id: i,
+            share,
+            mac_values: mac,
+            mac_keys: key,
+        })
+        .collect()
+}
+
+pub fn secret_share<ShareFF, MacFF, R>(
+    secret: ShareFF,
+    n: u16,
+    rng: &mut R,
+) -> (Vec<AuthShare<ShareFF, MacFF>>, Vec<MacFF>)
+where
+    ShareFF: FiniteField,
+    MacFF: FiniteField,
+    ShareFF: IsSubFieldOf<MacFF>,
+    R: Rng + CryptoRng,
+{
+    // Generate the global Deltas
+    let deltas = (0..n).map(|_| MacFF::random(rng)).collect_vec();
+    (secret_share_with_delta(secret, &deltas, rng), deltas)
 }
 
 pub fn verify_and_reconstruct<ShareFF, MacFF>(

@@ -32,6 +32,25 @@ pub struct Wrk17Garbler<P: Preprocessor> {
     input_labels: Vec<F128b>,
     // Only filled for the evaluator
     input_keys: Vec<F128b>,
+
+    // This is for the output decoder
+    output_decoder: Vec<(F2, F128b)>,
+}
+
+impl<P: Preprocessor> Wrk17Garbler<P> {
+    pub fn new(party_id: u16, total_num_parties: u16, preprocessor: P) -> Self {
+        Self {
+            party_id,
+            total_num_parties,
+            preprocessor,
+            delta: F128b::ZERO,
+            input_shares: vec![],
+            input_macs: vec![],
+            input_labels: vec![],
+            input_keys: vec![],
+            output_decoder: vec![],
+        }
+    }
 }
 
 impl<P: Preprocessor> Wrk17Garbler<P> {
@@ -220,8 +239,8 @@ impl Wrk17GarbledRow {
             *a ^= b;
         }
 
-        let label_gamma = F128b::from_bytes(enc_label_gamma).unwrap();
-        label_gamma
+        // we're returning label_gamma
+        F128b::from_bytes(enc_label_gamma).unwrap()
     }
 }
 
@@ -387,11 +406,14 @@ impl MsgRound2 for Wrk17MsgRound2 {
 
 pub struct Wrk17MsgRound3 {
     labels: Vec<F128b>,
+    output_decoder: Vec<(F2, F128b)>,
 }
 
 impl MsgRound3 for Wrk17MsgRound3 {
-    fn into_labels(self) -> Vec<F128b> {
-        self.labels
+    type Decoder = Vec<(F2, F128b)>;
+
+    fn into_labels_and_decoder(self) -> (Vec<F128b>, Vec<(F2, F128b)>) {
+        (self.labels, self.output_decoder)
     }
 }
 
@@ -512,10 +534,10 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
             }
         }
 
-        // keep some information that we need for inputs
-        let input_len: u64 = circuit.input_sizes().iter().sum();
+        // Keep some information that we need for inputs
+        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
         self.delta = delta;
-        for input_idx in 0..input_len {
+        for input_idx in 0..input_wire_count {
             if !self.is_garbler() {
                 self.input_keys
                     .push(auth_bits[&input_idx].mac_keys[&(&self.total_num_parties - 1)]);
@@ -530,12 +552,26 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
             }
         }
 
+        // Keep some information for the output decoder
+        let output_wire_count: u64 = circuit.output_sizes().iter().sum();
+        let nwires = circuit.nwires();
+        if self.is_garbler() {
+            // (r^i_w, M_1[r^i_w])
+            self.output_decoder = (nwires - output_wire_count..nwires)
+                .map(|i| {
+                    (
+                        auth_bits[&i].share,
+                        auth_bits[&i].mac_values[&(self.total_num_parties - 1)],
+                    )
+                })
+                .collect();
+        }
+
         // prepare the actual garbled circuit
         if self.is_garbler() {
+            // Keep some information for the output decoder
             Wrk17Garbling::Garbler(garbler_output)
         } else {
-            let output_wire_count: u64 = circuit.output_sizes().iter().sum();
-            let nwires = circuit.nwires();
             debug_assert_eq!(nwires as usize, auth_bits.len());
             Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
                 garbling_shares: eval_output,
@@ -603,7 +639,10 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 output.push(*label + self.delta);
             }
         }
-        Wrk17MsgRound3 { labels: output }
+        Wrk17MsgRound3 {
+            labels: output,
+            output_decoder: self.output_decoder.clone(),
+        }
     }
 }
 
