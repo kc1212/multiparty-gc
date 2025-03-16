@@ -107,7 +107,7 @@ impl Evaluator for Wrk17Evaluator {
                         &labels[*a as usize],
                         &labels[*b as usize],
                         *out,
-                        &self.garbling_shares[*out as usize],
+                        &self.garbling_shares[and_gate_ctr],
                         self.delta,
                     )?;
                     masked_wire_values[*out as usize] = new_share;

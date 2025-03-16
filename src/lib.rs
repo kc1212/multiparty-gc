@@ -138,7 +138,7 @@ mod test {
         let buf_reader = BufReader::new(f);
         let circuit = bristol_fashion::read(buf_reader).unwrap();
         let true_inputs = vec![F2::ONE, F2::ONE];
-        let total_num_parties = 3;
+        let total_num_parties = 2;
 
         // prepare preprocessor
         let mut rng = AesRng::new();

@@ -6,7 +6,7 @@ use std::{
 
 use bristol_fashion::{Circuit, Gate};
 use generic_array::GenericArray;
-use itertools::izip;
+use itertools::{Itertools, izip};
 use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
 use scuttlebutt::serialization::CanonicalSerialize;
@@ -31,7 +31,7 @@ pub struct Wrk17Garbler<P: Preprocessor> {
     input_macs: Vec<F128b>,
     input_labels: Vec<F128b>,
     // Only filled for the evaluator
-    input_keys: Vec<F128b>,
+    input_keys: Vec<Vec<F128b>>,
 
     // This is for the output decoder
     output_decoder: Vec<(F2, F128b)>,
@@ -525,6 +525,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                         };
                         garbler_output.push(garbled_gate);
                     } else {
+                        // NOTE: this is topological order
                         eval_output.push([share0, share1, share2, share3]);
                     }
                 }
@@ -539,8 +540,14 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         self.delta = delta;
         for input_idx in 0..input_wire_count {
             if !self.is_garbler() {
-                self.input_keys
-                    .push(auth_bits[&input_idx].mac_keys[&(&self.total_num_parties - 1)]);
+                // TODO avoid clone?
+                self.input_keys.push(
+                    auth_bits[&input_idx]
+                        .mac_keys
+                        .values()
+                        .cloned()
+                        .collect_vec(),
+                );
             } else {
                 let r = auth_bits[&input_idx].share;
                 let mac = auth_bits[&input_idx].mac_values[&(&self.total_num_parties - 1)];
@@ -604,12 +611,13 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         // so we find the corresponding MAC key and do a MAC check.
         // Also reconstruct at the same time.
         let mut output = true_inputs;
-        for Wrk17MsgRound1 { macs, shares } in msgs {
+        for (party_id, Wrk17MsgRound1 { macs, shares }) in msgs.into_iter().enumerate() {
             debug_assert_eq!(macs.len(), shares.len());
-            debug_assert_eq!(macs.len(), self.input_keys.len());
             debug_assert_eq!(macs.len(), output.len());
             // get the mac keys that I have
-            for (w, (share, mac, key)) in izip!(shares, macs, &self.input_keys).enumerate() {
+            for (w, (share, mac)) in izip!(shares, macs).enumerate() {
+                // note that self.input_keys[i][j] is the ith gate and jth party
+                let key = &self.input_keys[w][party_id];
                 if share * self.delta + *key != mac {
                     return Err(GcError::InputRound2CheckFailure);
                 }
