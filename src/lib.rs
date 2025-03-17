@@ -134,25 +134,32 @@ mod test {
     }
 
     #[test]
-    fn test_wrk17() {
-        let f = std::fs::File::open("circuits/and.txt").unwrap();
-        // let f = std::fs::File::open("circuits/and2.txt").unwrap();
-        let buf_reader = BufReader::new(f);
-        let circuit = bristol_fashion::read(buf_reader).unwrap();
-        // let true_inputs = vec![F2::ONE, F2::ONE, F2::ONE];
-        let true_inputs = vec![F2::ONE, F2::ONE];
-        let total_num_parties = 2;
+    fn test_wrk17_basic() {
+        let circuits_inputs = vec![
+            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+        ];
 
-        // prepare preprocessor
-        let mut rng = AesRng::new();
-        let preps = InsecureCircuitPreprocessor::new(total_num_parties, &circuit, &mut rng);
+        for (circuit_file, true_inputs) in circuits_inputs {
+            let f = std::fs::File::open(circuit_file).unwrap();
+            let buf_reader = BufReader::new(f);
+            let circuit = bristol_fashion::read(buf_reader).unwrap();
+            let total_num_parties = 5;
 
-        let garblers = preps
-            .into_iter()
-            .enumerate()
-            .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, total_num_parties, prep))
-            .collect_vec();
+            // prepare preprocessor
+            let mut rng = AesRng::new();
+            let preps = InsecureCircuitPreprocessor::new(total_num_parties, &circuit, &mut rng);
 
-        run_and_check::<_, Wrk17Evaluator>(garblers, &circuit, true_inputs);
+            let garblers = preps
+                .into_iter()
+                .enumerate()
+                .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, total_num_parties, prep))
+                .collect_vec();
+
+            run_and_check::<_, Wrk17Evaluator>(garblers, &circuit, true_inputs);
+        }
     }
 }

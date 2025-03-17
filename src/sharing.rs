@@ -13,7 +13,7 @@ use std::{
 
 use crate::error::GcError;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthShare<ShareFF, MacFF>
 where
     ShareFF: FiniteField,

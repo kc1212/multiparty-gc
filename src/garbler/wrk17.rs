@@ -261,7 +261,7 @@ pub(crate) fn decrypt_garbled_gate(
     label_as: &[F128b],
     label_bs: &[F128b],
     gate_id: u64,
-    evaluator_shares: &[AuthShare<F2, F128b>], // indexed over the 4 rows
+    evaluator_shares: &[AuthShare<F2, F128b>; 4],
     evaluator_delta: F128b,
 ) -> Result<(F2, Vec<F128b>), GcError> {
     // first get the row that we want to decrypt
@@ -272,10 +272,7 @@ pub(crate) fn decrypt_garbled_gate(
         (true, false) => 1,
         (false, false) => 0u8,
     };
-    #[cfg(test)]
-    {
-        println!("\tdecrypting {row_id}-th row");
-    }
+
     let party_count = garbled_gates.len() + 1;
     assert_eq!(party_count - 1, label_as.len());
     assert_eq!(party_count - 1, label_bs.len());
@@ -319,11 +316,12 @@ pub(crate) fn decrypt_garbled_gate(
     let mut output_label = vec![F128b::ZERO; party_count - 1];
     for (party_id, enc_label_gamma) in enc_label_gammas.iter_mut().enumerate() {
         // We need to decrypt the labels, for this we need MACs of the form
-        // sum_j M_i[r^j_{\gamma, \ell}] for j != i
+        // sum_j M_i[r^j_{\gamma, \ell}] for j != i, this needs to include M_1[...]
         let macs = (0..party_count - 1)
             .filter(|i| *i != party_id)
             .map(|i| r_shares[i].mac_values[&(party_id as u16)])
-            .fold(F128b::ZERO, |acc, x| acc + x);
+            .fold(F128b::ZERO, |acc, x| acc + x)
+            + evaluator_shares[row_id as usize].mac_values[&(party_id as u16)];
 
         // Decrypt using the sum of MACs
         let recovered_label = Wrk17GarbledRow::decrypt_label_gamma(enc_label_gamma, macs);

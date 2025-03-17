@@ -123,6 +123,10 @@ impl Evaluator for Wrk17Evaluator {
                             row3 += row.unencrypted_rows[3].share;
                         }
                         println!("\trows: ({row0:?}, {row1:?}, {row2:?}, {row3:?})");
+                        println!(
+                            "\tlabels: {:?}, {:?}",
+                            labels[*a as usize], labels[*b as usize]
+                        );
                     }
                     let (new_share, new_labels) = decrypt_garbled_gate(
                         &garblings[and_gate_ctr],
@@ -137,7 +141,10 @@ impl Evaluator for Wrk17Evaluator {
                     masked_wire_values[*out as usize] = new_share;
                     #[cfg(test)]
                     {
-                        println!("\tobtained masked_gamma={:?}", new_share);
+                        println!(
+                            "\tobtained masked_gamma={:?} with label={:?}",
+                            new_share, &new_labels
+                        );
                     }
 
                     debug_assert_eq!(labels[*out as usize].len(), new_labels.len());
