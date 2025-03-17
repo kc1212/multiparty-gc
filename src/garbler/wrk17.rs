@@ -231,6 +231,8 @@ impl Wrk17GarbledRow {
 pub struct Wrk17GarbledGate {
     party_id: u16,
     rows: [Wrk17GarbledRow; 4],
+    #[cfg(test)]
+    pub(crate) unencrypted_rows: [AuthShare<F2, F128b>; 4],
 }
 
 impl Index<u8> for Wrk17GarbledGate {
@@ -270,6 +272,10 @@ pub(crate) fn decrypt_garbled_gate(
         (true, false) => 1,
         (false, false) => 0u8,
     };
+    #[cfg(test)]
+    {
+        println!("\tdecrypting {row_id}-th row");
+    }
     let party_count = garbled_gates.len() + 1;
     assert_eq!(party_count - 1, label_as.len());
     assert_eq!(party_count - 1, label_bs.len());
@@ -511,6 +517,8 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                                     3,
                                 ),
                             ],
+                            #[cfg(test)]
+                            unencrypted_rows: [share0, share1, share2, share3],
                         };
                         garbler_output.push(garbled_gate);
                     } else {
@@ -537,6 +545,8 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                         .cloned()
                         .collect_vec(),
                 );
+                let r = auth_bits[&input_idx].share;
+                self.input_shares.push(r);
             } else {
                 let r = auth_bits[&input_idx].share;
                 let mac = auth_bits[&input_idx].mac_values[&(&self.total_num_parties - 1)];
@@ -597,6 +607,9 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
     ) -> Result<Vec<Wrk17MsgRound2>, GcError> {
         debug_assert_eq!(self.party_id, self.total_num_parties - 1);
 
+        #[cfg(test)]
+        println!("True inputs: {true_inputs:?}");
+
         // The evaluator receives r^i_w, M_1[r^i_w]
         // so we find the corresponding MAC key and do a MAC check.
         // Also reconstruct at the same time.
@@ -614,6 +627,14 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 output[w] += share;
             }
         }
+        // We also need to add the shares from the evaluator
+        debug_assert_eq!(output.len(), self.input_shares.len());
+        for (o, i) in output.iter_mut().zip(&self.input_shares) {
+            *o += *i;
+        }
+
+        #[cfg(test)]
+        println!("Masked inputs: {output:?}");
 
         Ok((0..self.total_num_parties)
             .map(|_| Wrk17MsgRound2 {

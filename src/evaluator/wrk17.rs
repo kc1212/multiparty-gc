@@ -106,6 +106,24 @@ impl Evaluator for Wrk17Evaluator {
                 Gate::AND { a, b, out } => {
                     let alpha = masked_wire_values[*a as usize];
                     let beta = masked_wire_values[*b as usize];
+                    #[cfg(test)]
+                    {
+                        println!(
+                            "Evaluating {and_gate_ctr}-th AND gate with a={a}, masked_a={:?}, b={b}, masked_b={:?}, gamma={out}",
+                            alpha, beta
+                        );
+                        let mut row0 = self.garbling_shares[and_gate_ctr][0].share;
+                        let mut row1 = self.garbling_shares[and_gate_ctr][1].share;
+                        let mut row2 = self.garbling_shares[and_gate_ctr][2].share;
+                        let mut row3 = self.garbling_shares[and_gate_ctr][3].share;
+                        for row in &garblings[and_gate_ctr] {
+                            row0 += row.unencrypted_rows[0].share;
+                            row1 += row.unencrypted_rows[1].share;
+                            row2 += row.unencrypted_rows[2].share;
+                            row3 += row.unencrypted_rows[3].share;
+                        }
+                        println!("\trows: ({row0:?}, {row1:?}, {row2:?}, {row3:?})");
+                    }
                     let (new_share, new_labels) = decrypt_garbled_gate(
                         &garblings[and_gate_ctr],
                         alpha,
@@ -117,6 +135,10 @@ impl Evaluator for Wrk17Evaluator {
                         self.delta,
                     )?;
                     masked_wire_values[*out as usize] = new_share;
+                    #[cfg(test)]
+                    {
+                        println!("\tobtained masked_gamma={:?}", new_share);
+                    }
 
                     debug_assert_eq!(labels[*out as usize].len(), new_labels.len());
                     debug_assert!(labels[*out as usize].iter().all(|x| *x == F128b::ZERO));

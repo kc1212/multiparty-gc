@@ -79,7 +79,7 @@ mod test {
             gcs.push(garbler.garble(&mut rng, circuit));
         }
 
-        let evaluator = garblers.pop().unwrap();
+        let final_garbler = garblers.pop().unwrap();
         let evaluator_gc = gcs.pop().unwrap();
 
         // do the first round of communication
@@ -91,7 +91,7 @@ mod test {
 
         // do the second round of communication
         // the evaluator processes the messages and then creates the response
-        let msgs_round2 = evaluator
+        let msgs_round2 = final_garbler
             .input_round_2(true_inputs.clone(), msgs_round1)
             .unwrap();
         let masked_inputs = msgs_round2[0].clone().into_masked_inputs();
@@ -136,8 +136,10 @@ mod test {
     #[test]
     fn test_wrk17() {
         let f = std::fs::File::open("circuits/and.txt").unwrap();
+        // let f = std::fs::File::open("circuits/and2.txt").unwrap();
         let buf_reader = BufReader::new(f);
         let circuit = bristol_fashion::read(buf_reader).unwrap();
+        // let true_inputs = vec![F2::ONE, F2::ONE, F2::ONE];
         let true_inputs = vec![F2::ONE, F2::ONE];
         let total_num_parties = 2;
 

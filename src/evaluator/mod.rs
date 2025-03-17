@@ -27,6 +27,4 @@ pub trait Evaluator {
         encoded: Self::GarbledOutput,
         decoder: Vec<Self::Decoder>,
     ) -> Result<Vec<F2>, GcError>;
-
-    // fn input_round_2(&self, msg: Self::MR1) -> Self::MR2;
 }

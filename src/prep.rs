@@ -73,6 +73,7 @@ impl InsecureCircuitPreprocessor {
         let input_wire_count: u64 = circuit.input_sizes().iter().sum();
         for w in 0..input_wire_count {
             let secret = F2::random(rng);
+            // let secret = F2::ZERO;
             for (party_id, auth_share) in secret_share_with_delta(secret, &deltas, rng)
                 .into_iter()
                 .enumerate()
@@ -88,6 +89,7 @@ impl InsecureCircuitPreprocessor {
                 bristol_fashion::Gate::AND { a, b, out } => {
                     // generate the auth bit
                     let secret = F2::random(rng);
+                    // let secret = F2::ZERO;
                     #[cfg(test)]
                     {
                         println!("secret for auth bit: {secret:?}");
