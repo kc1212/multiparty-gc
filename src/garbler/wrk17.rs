@@ -450,6 +450,21 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                         wire_labels.insert(*out, wire_labels[a] + wire_labels[b]);
                     }
                 }
+                Gate::INV { a, out } => {
+                    let auth_bit = if self.is_garbler() {
+                        wire_labels.insert(*out, wire_labels[a] + delta);
+                        let mut tmp = auth_bits[a].clone();
+                        *tmp.mac_keys
+                            .get_mut(&(&self.total_num_parties - 1))
+                            .unwrap() += delta;
+                        tmp
+                    } else {
+                        let mut tmp = auth_bits[a].clone();
+                        tmp.share += F2::ONE;
+                        tmp
+                    };
+                    auth_bits.insert(*out, auth_bit);
+                }
                 Gate::AND { a, b, out } => {
                     // we assume the and triples come in topological order
                     let auth_prod = auth_prods.pop().unwrap();
@@ -524,9 +539,8 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                         eval_output.push([share0, share1, share2, share3]);
                     }
                 }
-                bristol_fashion::Gate::INV { a: _, out: _ } => todo!(),
-                bristol_fashion::Gate::EQ { lit: _, out: _ } => todo!(),
-                bristol_fashion::Gate::EQW { a: _, out: _ } => todo!(),
+                Gate::EQ { lit: _, out: _ } => unimplemented!("EQ gate not supported"),
+                Gate::EQW { a: _, out: _ } => unimplemented!("EQW gate not supported"),
             }
         }
 

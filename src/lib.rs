@@ -141,6 +141,7 @@ mod test {
             ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
             ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
             ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
         ];
 
         for (circuit_file, true_inputs) in circuits_inputs {
