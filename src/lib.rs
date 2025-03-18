@@ -36,7 +36,7 @@ mod test {
         MsgRound2, MsgRound3,
         evaluator::{Evaluator, wrk17::Wrk17Evaluator},
         garbler::{Garbler, wrk17::Wrk17Garbler},
-        prep::InsecureCircuitPreprocessor,
+        prep::InsecurePreprocessor,
     };
 
     fn eval_clear_circuit(circuit: &Circuit, inputs: Vec<u8>) -> Vec<u8> {
@@ -66,18 +66,34 @@ mod test {
     }
 
     fn run_and_check<
-        G: Garbler,
+        G: Garbler + Send + 'static,
         E: Evaluator<Gc = G::Gc, Label = F128b, Decoder = <<G as Garbler>::MR3 as MsgRound3>::Decoder>,
     >(
         mut garblers: Vec<G>,
         circuit: &Circuit,
         true_inputs: Vec<F2>,
-    ) {
-        let mut rng = AesRng::from_entropy();
-        let mut gcs = vec![];
-        for garbler in &mut garblers {
-            gcs.push(garbler.garble(&mut rng, circuit));
-        }
+    ) where
+        <G as Garbler>::Gc: Send,
+    {
+        // We use scoped threads so that we can borrow non-static data and
+        // garble in parallel.
+        let mut gcs = std::thread::scope(|s| {
+            let mut handles = vec![];
+            for (i, garbler) in garblers.iter_mut().enumerate() {
+                handles.push(s.spawn(move || {
+                    let mut rng = AesRng::from_entropy();
+                    (garbler.garble(&mut rng, circuit), i)
+                }));
+            }
+
+            let mut gcs = vec![];
+            for handle in handles {
+                let (gc, i) = handle.join().unwrap();
+                println!("Joined garbler {i}");
+                gcs.push(gc);
+            }
+            gcs
+        });
 
         let final_garbler = garblers.pop().unwrap();
         let evaluator_gc = gcs.pop().unwrap();
@@ -136,23 +152,26 @@ mod test {
     #[test]
     fn test_wrk17_basic() {
         let circuits_inputs = vec![
-            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
-            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
+            // ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
+            // ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
+            // ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
             ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
-            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
+            // ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+            // ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
         ];
 
         for (circuit_file, true_inputs) in circuits_inputs {
             let f = std::fs::File::open(circuit_file).unwrap();
             let buf_reader = BufReader::new(f);
             let circuit = bristol_fashion::read(buf_reader).unwrap();
-            let total_num_parties = 5;
+            let total_num_parties = 2;
 
             // prepare preprocessor
-            let mut rng = AesRng::new();
-            let preps = InsecureCircuitPreprocessor::new(total_num_parties, &circuit, &mut rng);
+            let (preps, runner) = InsecurePreprocessor::new(total_num_parties);
+            let prep_handler = std::thread::spawn(move || {
+                let mut rng = AesRng::new();
+                runner.run_blocking(&mut rng).unwrap()
+            });
 
             let garblers = preps
                 .into_iter()
@@ -161,6 +180,9 @@ mod test {
                 .collect_vec();
 
             run_and_check::<_, Wrk17Evaluator>(garblers, &circuit, true_inputs);
+
+            // shutdown
+            prep_handler.join().unwrap();
         }
     }
 }

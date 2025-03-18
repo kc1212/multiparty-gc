@@ -418,27 +418,43 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
     where
         R: Rng + CryptoRng,
     {
-        let delta = self.preprocessor.init_delta();
-        let gate_count = circuit.gates().len();
+        let delta = self.preprocessor.init_delta().unwrap();
+        let input_count: u64 = circuit.input_sizes().iter().sum();
+        let and_gate_count = circuit.nand();
 
-        let (mut auth_bits, mut auth_prods) =
-            self.preprocessor.auth_materials_from_circuit(circuit);
-
-        // Reverse the authenticated products since we're going to pop them later
-        auth_prods.reverse();
-        assert_eq!(
-            auth_prods.len(),
-            circuit
-                .gates()
-                .iter()
-                .filter(|g| matches!(g, Gate::AND { a: _, b: _, out: _ }))
-                .count()
-        );
+        // We get a vector of authenticated bits that do not map to wires yet.
+        // So firstly we map them to wires.
+        let mut unindexed_auth_bits = self
+            .preprocessor
+            .auth_bits(input_count + and_gate_count)
+            .unwrap();
+        let mut auth_bits = BTreeMap::new();
+        for i in 0..input_count {
+            auth_bits.insert(i, unindexed_auth_bits.pop().unwrap());
+        }
+        for gate in circuit.gates() {
+            match gate {
+                Gate::AND { a: _, b: _, out } => {
+                    auth_bits.insert(*out, unindexed_auth_bits.pop().unwrap());
+                }
+                _ => { /* do nothing */ }
+            }
+        }
+        assert!(unindexed_auth_bits.is_empty());
 
         let mut wire_labels = self.gen_labels(rng, circuit);
 
-        let mut garbler_output = Vec::with_capacity(if self.is_garbler() { gate_count } else { 0 });
-        let mut eval_output = Vec::with_capacity(if self.is_garbler() { 0 } else { gate_count });
+        let mut garbler_output = Vec::with_capacity(if self.is_garbler() {
+            and_gate_count as usize
+        } else {
+            0
+        });
+        let mut eval_output = Vec::with_capacity(if self.is_garbler() {
+            0
+        } else {
+            and_gate_count as usize
+        });
+
         for gate in circuit.gates() {
             match gate {
                 Gate::XOR { a, b, out } => {
@@ -466,23 +482,26 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                     auth_bits.insert(*out, auth_bit);
                 }
                 Gate::AND { a, b, out } => {
-                    // we assume the and triples come in topological order
-                    let auth_prod = auth_prods.pop().unwrap();
+                    let bit_a = &auth_bits[a];
+                    let bit_b = &auth_bits[b];
+                    let bit_out = &auth_bits[out];
+                    let auth_prod = self.preprocessor.auth_mul(bit_a, bit_b).unwrap();
+
                     // a = 0, b = 0: \lambda_a \lambda_b + \lambda_\gamma
-                    let share0 = &auth_prod + &auth_bits[out];
+                    let share0 = &auth_prod + bit_out;
                     // a = 0, b = 1: \lambda_a + \lambda_a \lambda_b + \lambda_\gamma
-                    let share1 = &share0 + &auth_bits[a];
+                    let share1 = &share0 + bit_a;
                     // a = 1, b = 0: \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
-                    let share2 = &share0 + &auth_bits[b];
+                    let share2 = &share0 + bit_b;
                     // a = 1, b = 1: 1 + \lambda_a + \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
                     let share3 = if self.is_garbler() {
-                        let mut tmp = &share1 + &auth_bits[b];
+                        let mut tmp = &share1 + bit_b;
                         *tmp.mac_keys
                             .get_mut(&(&self.total_num_parties - 1))
                             .unwrap() += delta;
                         tmp
                     } else {
-                        let mut tmp = &share1 + &auth_bits[b];
+                        let mut tmp = &share1 + bit_b;
                         tmp.share += F2::ONE;
                         tmp
                     };
@@ -584,8 +603,14 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 })
                 .collect();
         }
+        self.preprocessor.done();
 
         // prepare the actual garbled circuit
+        #[cfg(test)]
+        {
+            println!("Party {} finished garbling", self.party_id);
+        }
+
         if self.is_garbler() {
             // Keep some information for the output decoder
             Wrk17Garbling::Garbler(garbler_output)
