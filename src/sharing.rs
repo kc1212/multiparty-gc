@@ -205,7 +205,7 @@ where
 pub fn verify_and_reconstruct<ShareFF, MacFF>(
     n: u16,
     shares: Vec<AuthShare<ShareFF, MacFF>>,
-    deltas: Vec<MacFF>,
+    deltas: &[MacFF],
 ) -> Result<ShareFF, GcError>
 where
     ShareFF: FiniteField,
@@ -249,7 +249,7 @@ mod test {
         let n = 10u16;
         let secret = F2::random(&mut rng);
         let (shares, deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
-        assert_eq!(secret, verify_and_reconstruct(n, shares, deltas).unwrap());
+        assert_eq!(secret, verify_and_reconstruct(n, shares, &deltas).unwrap());
     }
 
     #[test]
@@ -261,13 +261,13 @@ mod test {
             // modify a share
             let (mut shares, deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
             shares[0].share += F2::ONE;
-            verify_and_reconstruct(n, shares, deltas).unwrap_err();
+            verify_and_reconstruct(n, shares, &deltas).unwrap_err();
         }
         {
             // modify a delta
             let (shares, mut deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
             deltas[0] += F128b::ONE;
-            verify_and_reconstruct(n, shares, deltas).unwrap_err();
+            verify_and_reconstruct(n, shares, &deltas).unwrap_err();
         }
     }
 

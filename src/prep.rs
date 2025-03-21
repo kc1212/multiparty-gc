@@ -11,6 +11,7 @@ use swanky_field_binary::F128b;
 use crate::error::GcError;
 use crate::sharing::AuthShare;
 use crate::sharing::secret_share_with_delta;
+use crate::sharing::verify_and_reconstruct;
 
 /// Static preprocessor is one that has no networking.
 ///
@@ -47,31 +48,40 @@ pub trait Preprocessor: StaticPreprocessor {
 }
 
 enum InsecurePreprocessorReq {
-    Delta,
-    Bits(u64),
-    Triple((AuthShare<F2, F128b>, AuthShare<F2, F128b>)),
+    Delta(u16),
+    Bits(u16, u64),
+    Triple(u16, (AuthShare<F2, F128b>, AuthShare<F2, F128b>)),
     // Triples(Vec<(AuthShare<F2, F128b>, AuthShare<F2, F128b>)>),
-    Done,
+    Done(u16),
 }
 
 impl InsecurePreprocessorReq {
+    fn get_party_id(&self) -> u16 {
+        *match self {
+            InsecurePreprocessorReq::Delta(pid) => pid,
+            InsecurePreprocessorReq::Bits(pid, _) => pid,
+            InsecurePreprocessorReq::Triple(pid, (_, _)) => pid,
+            InsecurePreprocessorReq::Done(pid) => pid,
+        }
+    }
+
     fn take_delta(self) -> Result<(), GcError> {
         match self {
-            InsecurePreprocessorReq::Delta => Ok(()),
+            InsecurePreprocessorReq::Delta(_) => Ok(()),
             _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
         }
     }
 
     fn take_bits(self) -> Result<u64, GcError> {
         match self {
-            InsecurePreprocessorReq::Bits(x) => Ok(x),
+            InsecurePreprocessorReq::Bits(_, x) => Ok(x),
             _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
         }
     }
 
     fn take_triple(self) -> Result<(AuthShare<F2, F128b>, AuthShare<F2, F128b>), GcError> {
         match self {
-            InsecurePreprocessorReq::Triple(t) => Ok(t),
+            InsecurePreprocessorReq::Triple(_, t) => Ok(t),
             _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
         }
     }
@@ -85,7 +95,7 @@ impl InsecurePreprocessorReq {
 
     fn take_done(self) -> Result<(), GcError> {
         match self {
-            InsecurePreprocessorReq::Done => Ok(()),
+            InsecurePreprocessorReq::Done(_) => Ok(()),
             _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
         }
     }
@@ -159,9 +169,13 @@ impl InsecurePreprocessorRunner {
                 batch.push(msg);
             }
 
+            // NOTE: sorting is not strictly necessary if we do not reconstruct with verification
+            // when processing auth_mul
+            batch.sort_by_key(|a| a.get_party_id());
+
             // we need to make sure all messages in the batch are the same
             match &batch[0] {
-                InsecurePreprocessorReq::Delta => {
+                InsecurePreprocessorReq::Delta(_) => {
                     let _out = batch
                         .into_iter()
                         .map(|x| x.take_delta())
@@ -172,7 +186,7 @@ impl InsecurePreprocessorRunner {
                         ch.send(InsecurePreprocessorResp::Delta(*delta))?;
                     }
                 }
-                InsecurePreprocessorReq::Bits(_) => {
+                InsecurePreprocessorReq::Bits(..) => {
                     let reqs = batch
                         .into_iter()
                         .map(|x| x.take_bits())
@@ -192,17 +206,16 @@ impl InsecurePreprocessorRunner {
                         ch.send(InsecurePreprocessorResp::Bits(share))?;
                     }
                 }
-                InsecurePreprocessorReq::Triple(_) => {
+                InsecurePreprocessorReq::Triple(..) => {
                     let reqs = batch
                         .into_iter()
                         .map(|x| x.take_triple())
                         .collect::<Result<Vec<_>, _>>()?;
 
                     // sum the as and bs
-                    let (a, b) = reqs
-                        .into_iter()
-                        .map(|(a, b)| (a.share, b.share))
-                        .fold((F2::ZERO, F2::ZERO), |acc, (a, b)| (acc.0 + a, acc.0 + b));
+                    let (bits_a, bits_b) = reqs.into_iter().unzip();
+                    let a = verify_and_reconstruct(party_count as u16, bits_a, &deltas).unwrap();
+                    let b = verify_and_reconstruct(party_count as u16, bits_b, &deltas).unwrap();
 
                     let prod = a * b;
 
@@ -211,10 +224,10 @@ impl InsecurePreprocessorRunner {
                         ch.send(InsecurePreprocessorResp::Triple(share))?;
                     }
                 }
-                // InsecurePreprocessorReq::Triples(_) => {
+                // InsecurePreprocessorReq::Triples(..) => {
                 //     unimplemented!()
                 // }
-                InsecurePreprocessorReq::Done => {
+                InsecurePreprocessorReq::Done(_) => {
                     let _out = batch
                         .into_iter()
                         .map(|x| x.take_done())
@@ -229,6 +242,7 @@ impl InsecurePreprocessorRunner {
 /// This struct needs to be initialized correctly so that
 /// all instances of [Self] are connected to [InsecurePreprocessorRunner].
 pub struct InsecurePreprocessor {
+    party_id: u16,
     party_count: u16,
     /// Channel for sending commands to the central [InsecurePreprocessorRunner].
     send_chan: Sender<InsecurePreprocessorReq>,
@@ -242,13 +256,15 @@ impl StaticPreprocessor for InsecurePreprocessor {
     }
 
     fn init_delta(&mut self) -> Result<F128b, GcError> {
-        self.send_chan.send(InsecurePreprocessorReq::Delta)?;
+        self.send_chan
+            .send(InsecurePreprocessorReq::Delta(self.party_id))?;
         let res = self.recv_chan.recv()?;
         res.expect_delta()
     }
 
     fn auth_bits(&mut self, m: u64) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
-        self.send_chan.send(InsecurePreprocessorReq::Bits(m))?;
+        self.send_chan
+            .send(InsecurePreprocessorReq::Bits(self.party_id, m))?;
         let res = self.recv_chan.recv()?;
         res.expect_bits()
     }
@@ -258,8 +274,10 @@ impl StaticPreprocessor for InsecurePreprocessor {
         x: &AuthShare<F2, F128b>,
         y: &AuthShare<F2, F128b>,
     ) -> Result<AuthShare<F2, F128b>, GcError> {
-        self.send_chan
-            .send(InsecurePreprocessorReq::Triple((x.clone(), y.clone())))?;
+        self.send_chan.send(InsecurePreprocessorReq::Triple(
+            self.party_id,
+            (x.clone(), y.clone()),
+        ))?;
         let res = self.recv_chan.recv()?;
         res.expect_triple()
     }
@@ -281,7 +299,9 @@ impl StaticPreprocessor for InsecurePreprocessor {
     }
 
     fn done(&mut self) {
-        let _ = self.send_chan.send(InsecurePreprocessorReq::Done);
+        let _ = self
+            .send_chan
+            .send(InsecurePreprocessorReq::Done(self.party_id));
     }
 }
 
@@ -289,11 +309,12 @@ impl InsecurePreprocessor {
     pub fn new(party_count: u16) -> (Vec<Self>, InsecurePreprocessorRunner) {
         let (req_send_chan, req_recv_chan) = mpsc::channel();
         let (resp_send_chans, preps) = (0..party_count)
-            .map(|_| {
+            .map(|party_id| {
                 let (resp_send_chan, resp_recv_chan) = mpsc::channel();
                 (
                     resp_send_chan,
                     Self {
+                        party_id,
                         party_count,
                         send_chan: req_send_chan.clone(),
                         recv_chan: resp_recv_chan,

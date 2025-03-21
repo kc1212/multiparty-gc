@@ -152,12 +152,12 @@ mod test {
     #[test]
     fn test_wrk17_basic() {
         let circuits_inputs = vec![
-            // ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
-            // ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
-            // ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
             ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
-            // ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
-            // ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
         ];
 
         for (circuit_file, true_inputs) in circuits_inputs {

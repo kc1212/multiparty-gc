@@ -419,17 +419,17 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         R: Rng + CryptoRng,
     {
         let delta = self.preprocessor.init_delta().unwrap();
-        let input_count: u64 = circuit.input_sizes().iter().sum();
+        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
         let and_gate_count = circuit.nand();
 
         // We get a vector of authenticated bits that do not map to wires yet.
         // So firstly we map them to wires.
         let mut unindexed_auth_bits = self
             .preprocessor
-            .auth_bits(input_count + and_gate_count)
+            .auth_bits(input_wire_count + and_gate_count)
             .unwrap();
         let mut auth_bits = BTreeMap::new();
-        for i in 0..input_count {
+        for i in 0..input_wire_count {
             auth_bits.insert(i, unindexed_auth_bits.pop().unwrap());
         }
         for gate in circuit.gates() {
@@ -467,19 +467,10 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                     }
                 }
                 Gate::INV { a, out } => {
-                    let auth_bit = if self.is_garbler() {
+                    if self.is_garbler() {
                         wire_labels.insert(*out, wire_labels[a] + delta);
-                        let mut tmp = auth_bits[a].clone();
-                        *tmp.mac_keys
-                            .get_mut(&(&self.total_num_parties - 1))
-                            .unwrap() += delta;
-                        tmp
-                    } else {
-                        let mut tmp = auth_bits[a].clone();
-                        tmp.share += F2::ONE;
-                        tmp
-                    };
-                    auth_bits.insert(*out, auth_bit);
+                    }
+                    auth_bits.insert(*out, auth_bits[a].clone());
                 }
                 Gate::AND { a, b, out } => {
                     let bit_a = &auth_bits[a];

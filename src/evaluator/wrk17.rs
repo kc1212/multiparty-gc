@@ -103,6 +103,13 @@ impl Evaluator for Wrk17Evaluator {
                         .collect_vec();
                     labels[*out as usize] = label;
                 }
+                Gate::INV { a, out } => {
+                    masked_wire_values[*out as usize] = masked_wire_values[*a as usize] + F2::ONE;
+                    let label = (0..(party_count - 1))
+                        .map(|i| labels[*a as usize][i])
+                        .collect_vec();
+                    labels[*out as usize] = label;
+                }
                 Gate::AND { a, b, out } => {
                     let alpha = masked_wire_values[*a as usize];
                     let beta = masked_wire_values[*b as usize];
@@ -153,7 +160,6 @@ impl Evaluator for Wrk17Evaluator {
                     labels[*out as usize] = new_labels;
                     and_gate_ctr += 1;
                 }
-                Gate::INV { a: _, out: _ } => unimplemented!(),
                 Gate::EQ { lit: _, out: _ } => unimplemented!(),
                 Gate::EQW { a: _, out: _ } => unimplemented!(),
             }
