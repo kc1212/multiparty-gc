@@ -149,6 +149,38 @@ mod test {
         assert_eq!(eval_clear_circuit(&circuit, vec![1, 1]), vec![1]);
     }
 
+    fn run_and_check_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
+        // prepare preprocessor
+        let (preps, runner) = InsecurePreprocessor::new(num_parties);
+        let prep_handler = std::thread::spawn(move || {
+            let mut rng = AesRng::new();
+            runner.run_blocking(&mut rng).unwrap()
+        });
+
+        let garblers = preps
+            .into_iter()
+            .enumerate()
+            .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
+            .collect_vec();
+
+        run_and_check::<_, Wrk17Evaluator>(garblers, circuit, true_inputs);
+
+        // shutdown
+        prep_handler.join().unwrap();
+    }
+
+    #[test]
+    fn test_wrk17_aes() {
+        let f = std::fs::File::open("circuits/aes_128.txt").unwrap();
+        let buf_reader = BufReader::new(f);
+        let circuit = bristol_fashion::read(buf_reader).unwrap();
+        let num_parties = 3;
+
+        let input_length: u64 = circuit.input_sizes().iter().sum();
+        let true_inputs = vec![F2::ZERO; input_length as usize];
+        run_and_check_insecure_prep(&circuit, num_parties, true_inputs);
+    }
+
     #[test]
     fn test_wrk17_basic() {
         let circuits_inputs = vec![
@@ -164,25 +196,9 @@ mod test {
             let f = std::fs::File::open(circuit_file).unwrap();
             let buf_reader = BufReader::new(f);
             let circuit = bristol_fashion::read(buf_reader).unwrap();
-            let total_num_parties = 2;
+            let num_parties = 5;
 
-            // prepare preprocessor
-            let (preps, runner) = InsecurePreprocessor::new(total_num_parties);
-            let prep_handler = std::thread::spawn(move || {
-                let mut rng = AesRng::new();
-                runner.run_blocking(&mut rng).unwrap()
-            });
-
-            let garblers = preps
-                .into_iter()
-                .enumerate()
-                .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, total_num_parties, prep))
-                .collect_vec();
-
-            run_and_check::<_, Wrk17Evaluator>(garblers, &circuit, true_inputs);
-
-            // shutdown
-            prep_handler.join().unwrap();
+            run_and_check_insecure_prep(&circuit, num_parties, true_inputs);
         }
     }
 }

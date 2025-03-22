@@ -199,9 +199,14 @@ impl Evaluator for Wrk17Evaluator {
             return Err(GcError::DecoderLengthError);
         }
 
+        let decoder = transpose(decoder);
+
         let mut _check_count = 0;
+        // Iterate over the wires
         for (all_shares_macs, key) in decoder.iter().zip(&self.wire_mask_shares) {
+            // Iterate over the parties
             for (i, (share, mac)) in all_shares_macs.iter().enumerate() {
+                // r^i_w, M_1[r^i_w], K_1[r^i_w] is valid
                 let key = key.mac_keys[&(i as u16)];
                 if *share * self.delta + key != *mac {
                     return Err(GcError::DecoderCheckFailure);
@@ -217,7 +222,6 @@ impl Evaluator for Wrk17Evaluator {
             println!("{_check_count} decoder checks passed");
         }
 
-        let decoder = transpose(decoder);
         assert_eq!(decoder.len(), encoded.masked_output_values.len());
 
         // reconstruct the shares, note that we need all shares

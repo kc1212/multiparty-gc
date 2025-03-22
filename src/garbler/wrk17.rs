@@ -63,27 +63,17 @@ impl<P: Preprocessor> Wrk17Garbler<P> {
         R: Rng + CryptoRng,
     {
         let mut output = BTreeMap::new();
+        let input_length: u64 = circuit.input_sizes().iter().sum();
+        for i in 0..input_length {
+            output.insert(i, F128b::random(rng));
+        }
         if self.is_garbler() {
-            // TODO not the most efficient way to make labels
-            // a better way would to find all the wire IDs first
             for gate in circuit.gates() {
                 match gate {
-                    Gate::XOR { a, b, out } => {
-                        output.entry(*a).or_insert_with(|| F128b::random(rng));
-                        output.entry(*b).or_insert_with(|| F128b::random(rng));
-                        output.entry(*out).or_insert_with(|| F128b::random(rng));
+                    Gate::AND { a: _, b: _, out } => {
+                        output.insert(*out, F128b::random(rng));
                     }
-                    Gate::AND { a, b, out } => {
-                        output.entry(*a).or_insert_with(|| F128b::random(rng));
-                        output.entry(*b).or_insert_with(|| F128b::random(rng));
-                        output.entry(*out).or_insert_with(|| F128b::random(rng));
-                    }
-                    Gate::INV { a, out } => {
-                        output.entry(*a).or_insert_with(|| F128b::random(rng));
-                        output.entry(*out).or_insert_with(|| F128b::random(rng));
-                    }
-                    Gate::EQ { lit: _, out: _ } => unimplemented!("EQ gate is not implemented"),
-                    Gate::EQW { a: _, out: _ } => unimplemented!("EQW gate is not implemented"),
+                    _ => { /* do nothing */ }
                 }
             }
         }
@@ -343,6 +333,7 @@ pub(crate) fn decrypt_garbled_gate(
 pub struct Wrk17EvaluatorOutput {
     pub(crate) total_num_parties: u16,
     pub(crate) garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
+    /// The authenticated bits of the wire masks \lambda_w of the output wires.
     pub(crate) wire_mask_shares: Vec<AuthShare<F2, F128b>>,
     pub(crate) delta: F128b,
 }
