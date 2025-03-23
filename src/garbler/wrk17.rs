@@ -13,7 +13,8 @@ use scuttlebutt::serialization::CanonicalSerialize;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    MsgRound1, MsgRound2, MsgRound3, error::GcError, prep::Preprocessor, sharing::AuthShare,
+    MsgRound1, MsgRound2, MsgRound3, error::GcError, garbler::auth_bits_from_prep,
+    prep::Preprocessor, sharing::AuthShare,
 };
 
 use super::{Garbler, Garbling};
@@ -22,7 +23,7 @@ use super::{Garbler, Garbling};
 /// we set the last party (n-1) as the evaluator instead of the first.
 pub struct Wrk17Garbler<P: Preprocessor> {
     party_id: u16,
-    total_num_parties: u16,
+    num_parties: u16,
     preprocessor: P,
 
     // These are only inputs for party 1
@@ -41,7 +42,7 @@ impl<P: Preprocessor> Wrk17Garbler<P> {
     pub fn new(party_id: u16, total_num_parties: u16, preprocessor: P) -> Self {
         Self {
             party_id,
-            total_num_parties,
+            num_parties: total_num_parties,
             preprocessor,
             delta: F128b::ZERO,
             input_shares: vec![],
@@ -50,34 +51,6 @@ impl<P: Preprocessor> Wrk17Garbler<P> {
             input_keys: vec![],
             output_decoder: vec![],
         }
-    }
-}
-
-impl<P: Preprocessor> Wrk17Garbler<P> {
-    fn is_garbler(&self) -> bool {
-        self.party_id != self.total_num_parties - 1
-    }
-
-    fn gen_labels<R>(&mut self, rng: &mut R, circuit: &Circuit) -> BTreeMap<u64, F128b>
-    where
-        R: Rng + CryptoRng,
-    {
-        let mut output = BTreeMap::new();
-        let input_length: u64 = circuit.input_sizes().iter().sum();
-        for i in 0..input_length {
-            output.insert(i, F128b::random(rng));
-        }
-        if self.is_garbler() {
-            for gate in circuit.gates() {
-                match gate {
-                    Gate::AND { a: _, b: _, out } => {
-                        output.insert(*out, F128b::random(rng));
-                    }
-                    _ => { /* do nothing */ }
-                }
-            }
-        }
-        output
     }
 }
 
@@ -405,36 +378,20 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         self.party_id
     }
 
+    fn num_parties(&self) -> u16 {
+        self.num_parties
+    }
+
     fn garble<R>(&mut self, rng: &mut R, circuit: &Circuit) -> Wrk17Garbling
     where
         R: Rng + CryptoRng,
     {
         let delta = self.preprocessor.init_delta().unwrap();
-        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
-        let and_gate_count = circuit.nand();
-
-        // We get a vector of authenticated bits that do not map to wires yet.
-        // So firstly we map them to wires.
-        let mut unindexed_auth_bits = self
-            .preprocessor
-            .auth_bits(input_wire_count + and_gate_count)
-            .unwrap();
-        let mut auth_bits = BTreeMap::new();
-        for i in 0..input_wire_count {
-            auth_bits.insert(i, unindexed_auth_bits.pop().unwrap());
-        }
-        for gate in circuit.gates() {
-            match gate {
-                Gate::AND { a: _, b: _, out } => {
-                    auth_bits.insert(*out, unindexed_auth_bits.pop().unwrap());
-                }
-                _ => { /* do nothing */ }
-            }
-        }
-        assert!(unindexed_auth_bits.is_empty());
+        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
 
         let mut wire_labels = self.gen_labels(rng, circuit);
 
+        let and_gate_count = circuit.nand();
         let mut garbler_output = Vec::with_capacity(if self.is_garbler() {
             and_gate_count as usize
         } else {
@@ -478,9 +435,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                     // a = 1, b = 1: 1 + \lambda_a + \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
                     let share3 = if self.is_garbler() {
                         let mut tmp = &share1 + bit_b;
-                        *tmp.mac_keys
-                            .get_mut(&(&self.total_num_parties - 1))
-                            .unwrap() += delta;
+                        *tmp.mac_keys.get_mut(&(&self.num_parties - 1)).unwrap() += delta;
                         tmp
                     } else {
                         let mut tmp = &share1 + bit_b;
@@ -562,7 +517,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 self.input_shares.push(r);
             } else {
                 let r = auth_bits[&input_idx].share;
-                let mac = auth_bits[&input_idx].mac_values[&(&self.total_num_parties - 1)];
+                let mac = auth_bits[&input_idx].mac_values[&(&self.num_parties - 1)];
                 self.input_shares.push(r);
                 self.input_macs.push(mac);
 
@@ -580,7 +535,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 .map(|i| {
                     (
                         auth_bits[&i].share,
-                        auth_bits[&i].mac_values[&(self.total_num_parties - 1)],
+                        auth_bits[&i].mac_values[&(self.num_parties - 1)],
                     )
                 })
                 .collect();
@@ -599,7 +554,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         } else {
             debug_assert_eq!(nwires as usize, auth_bits.len());
             Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
-                total_num_parties: self.total_num_parties,
+                total_num_parties: self.num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
                     .map(|i| auth_bits[&i].clone())
@@ -611,7 +566,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
     fn input_round_1(&self) -> Wrk17MsgRound1 {
         // Only the garbler can all this function
-        assert!(self.party_id != self.total_num_parties - 1);
+        assert!(self.party_id != self.num_parties - 1);
 
         Wrk17MsgRound1 {
             shares: self.input_shares.clone(),
@@ -624,7 +579,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         true_inputs: Vec<F2>,
         msgs: Vec<Wrk17MsgRound1>,
     ) -> Result<Vec<Wrk17MsgRound2>, GcError> {
-        debug_assert_eq!(self.party_id, self.total_num_parties - 1);
+        debug_assert_eq!(self.party_id, self.num_parties - 1);
 
         #[cfg(test)]
         println!("True inputs: {true_inputs:?}");
@@ -655,7 +610,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         #[cfg(test)]
         println!("Masked inputs: {output:?}");
 
-        Ok((0..self.total_num_parties)
+        Ok((0..self.num_parties)
             .map(|_| Wrk17MsgRound2 {
                 masked_inputs: output.clone(),
             })
@@ -666,7 +621,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
     /// then output the correct mask according to the masked input.
     fn input_round_3(&self, msg: Wrk17MsgRound2) -> Wrk17MsgRound3 {
         // Only the garbler can all this function
-        assert!(self.party_id != self.total_num_parties - 1);
+        assert!(self.party_id != self.num_parties - 1);
 
         let mut output = Vec::with_capacity(msg.masked_inputs.len());
         assert_eq!(msg.masked_inputs.len(), self.input_labels.len());

@@ -92,7 +92,7 @@ where
         Ok(())
     }
 
-    pub fn into_x_delta_i_share(&self, i: u16, delta: &MacFF) -> MacFF
+    pub fn to_x_delta_i_share(&self, i: u16, delta: &MacFF) -> MacFF
     where
         ShareFF: IsSubFieldOf<MacFF>,
     {
@@ -103,6 +103,14 @@ where
             // <x \Delta_i>_j = M_j[x^i]
             self.mac_values[&i]
         }
+    }
+
+    pub fn to_x_delta_shares(&self, delta: &MacFF) -> Vec<MacFF>
+    where
+        ShareFF: IsSubFieldOf<MacFF>,
+    {
+        let n = self.mac_keys.len() as u16 + 1;
+        (0..n).map(|i| self.to_x_delta_i_share(i, delta)).collect()
     }
 }
 
@@ -313,7 +321,7 @@ mod test {
         for i in 0..n {
             let actual = (0..n)
                 .map(|party_id| {
-                    shares[party_id as usize].into_x_delta_i_share(i, &deltas[party_id as usize])
+                    shares[party_id as usize].to_x_delta_i_share(i, &deltas[party_id as usize])
                 })
                 .fold(F128b::ZERO, |acc, x| acc + x);
             let expected = secret * deltas[i as usize];
