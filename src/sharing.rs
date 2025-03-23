@@ -91,6 +91,19 @@ where
         }
         Ok(())
     }
+
+    pub fn into_x_delta_i_share(&self, i: u16, delta: &MacFF) -> MacFF
+    where
+        ShareFF: IsSubFieldOf<MacFF>,
+    {
+        if self.party_id == i {
+            // <x \Delta_i>_i = x^i \Delta_i + \sum_{j \ne i} K_j[x^i]
+            self.share * *delta + self.sum_mac_keys()
+        } else {
+            // <x \Delta_i>_j = M_j[x^i]
+            self.mac_values[&i]
+        }
+    }
 }
 
 macro_rules! impl_add {
@@ -288,5 +301,24 @@ mod test {
 
         let mut buf = Cursor::new(writer.into_inner());
         share_new.deserialize_mac_values(n, &mut buf);
+    }
+
+    #[test]
+    fn test_into_x_delta_i_share() {
+        let mut rng = AesRng::new();
+        let n = 10u16;
+        let secret = F2::random(&mut rng);
+        let (shares, deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
+
+        for i in 0..n {
+            let actual = (0..n)
+                .map(|party_id| {
+                    shares[party_id as usize].into_x_delta_i_share(i, &deltas[party_id as usize])
+                })
+                .fold(F128b::ZERO, |acc, x| acc + x);
+            let expected = secret * deltas[i as usize];
+
+            assert_eq!(actual, expected)
+        }
     }
 }
