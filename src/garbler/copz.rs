@@ -1,9 +1,10 @@
-use std::io::{Cursor, Write};
+use std::io::{BufRead, Cursor, Read, Write};
 
 use bristol_fashion::{Circuit, Gate};
-use itertools::Itertools;
+use generic_array::GenericArray;
+use itertools::{Itertools, izip};
 use rand::{CryptoRng, Rng};
-use scuttlebutt::serialization::CanonicalSerialize;
+use scuttlebutt::{ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
@@ -48,6 +49,26 @@ struct CopzGarbledTable {
     inner: [Vec<u8>; 3],
 }
 
+fn lsb_f128b(x: &F128b) -> F2 {
+    if (x.to_bytes()[0] & 1) == 0 {
+        F2::ZERO
+    } else {
+        F2::ONE
+    }
+}
+
+/// Produce the three garbled tables and encrypt them.
+/// - `r1`: [\lambda_v]
+/// - `r2_0`: [\lambda_w + \lambda_u \lambda_v]
+/// - `r2_1`: [\lambda_w + \lambda_u \lambda_v + \lambda_u]
+/// - `k_u_0`:
+/// - `k_v_0`:
+/// - `k_w_0`:
+/// - `delta`:
+/// - `gate_id`:
+/// - `party_id`:
+/// - `num_parties`: the number of parties,
+///   should be consistent with the MACs/Keys in the authenticated shares
 fn encrypt_garbled_table(
     r1: &AuthShare<F2, F128b>,
     r2_0: &AuthShare<F2, F128b>,
@@ -62,29 +83,24 @@ fn encrypt_garbled_table(
 ) -> CopzGarbledTable {
     let out_len = 128 + (num_parties as usize - 2) * 128;
     let h = |k_left: &F128b, k_right: &F128b| {
-        let mut hasher_left = blake3::Hasher::new();
-        hasher_left.update(&k_left.to_bytes());
-        hasher_left.update(&gate_id.to_le_bytes());
-        hasher_left.update(&party_id.to_le_bytes());
-        let mut xof_reader_left = hasher_left.finalize_xof();
+        // NOTE, we use a single hasher instead of two,
+        // ideally we should use two CCR
+        let mut hasher = blake3::Hasher::new();
 
-        let mut hasher_right = blake3::Hasher::new();
-        hasher_right.update(&k_right.to_bytes());
-        hasher_right.update(&gate_id.to_le_bytes());
-        hasher_right.update(&party_id.to_le_bytes());
-        let mut xof_reader_right = hasher_left.finalize_xof();
+        // first part
+        hasher.update(&k_left.to_bytes());
+        hasher.update(&gate_id.to_le_bytes());
+        hasher.update(&party_id.to_le_bytes());
 
-        let mut h_left = vec![0u8; out_len];
-        xof_reader_left.fill(&mut h_left);
+        // second part
+        hasher.update(&k_right.to_bytes());
+        hasher.update(&gate_id.to_le_bytes());
+        hasher.update(&party_id.to_le_bytes());
 
-        let mut h_right = vec![0u8; out_len];
-        xof_reader_right.fill(&mut h_right);
-
-        h_left
-            .into_iter()
-            .zip(h_right)
-            .map(|(left, right)| left ^ right)
-            .collect_vec()
+        let mut xof_reader = hasher.finalize_xof();
+        let mut output = vec![0u8; out_len];
+        xof_reader.fill(&mut output);
+        output
     };
     // mask_1 = H(k_u_0, gate_id, party_id) + H(k_u_1, gate_id, party_id)
     let mut mask_1 = h(k_u_0, &(k_u_0 + delta));
@@ -123,6 +139,94 @@ fn encrypt_garbled_table(
     CopzGarbledTable {
         inner: [mask_1, mask_2, mask_3],
     }
+}
+
+fn decrypt_garbled_table(
+    garbled_tables: Vec<CopzGarbledTable>,
+    k_u_hats: Vec<F128b>,
+    k_v_hats: Vec<F128b>,
+    lambda_w_delta_i: Vec<F128b>,
+    lambda_v_delta_i: Vec<F128b>,
+    lambda_uv_delta_i: Vec<F128b>,
+    u_hat: F2,
+    v_hat: F2,
+    b_w: F2,
+    gate_id: u64,
+    party_id: u16,
+    num_parties: u16,
+) -> (Vec<F128b>, F2) {
+    assert_eq!(garbled_tables.len() - 1, num_parties as usize);
+    let out_len = 128 + (num_parties as usize - 2) * 128;
+    let h = |k_left: &F128b, k_right: &F128b| {
+        // NOTE, we use a single hasher instead of two,
+        // ideally we should use two CCR
+        let mut hasher = blake3::Hasher::new();
+
+        // first part
+        hasher.update(&k_left.to_bytes());
+        hasher.update(&gate_id.to_le_bytes());
+        hasher.update(&party_id.to_le_bytes());
+
+        // second part
+        hasher.update(&k_right.to_bytes());
+        hasher.update(&gate_id.to_le_bytes());
+        hasher.update(&party_id.to_le_bytes());
+
+        let mut xof_reader = hasher.finalize_xof();
+        let mut output = vec![0u8; out_len];
+        xof_reader.fill(&mut output);
+        output
+    };
+
+    // iterate over i
+    let mut output_labels = vec![];
+    for (garbled_table, k_u_hat, k_v_hat, lambda_w_delta, lambda_v_delta, lambda_uv_delta) in izip!(
+        garbled_tables,
+        k_u_hats,
+        k_v_hats,
+        lambda_w_delta_i,
+        lambda_v_delta_i,
+        lambda_uv_delta_i
+    ) {
+        // (k^i || {r^j_i}_{j != i, 1}) :=
+        // F_{k_u_hat}(g, i) + F_{k_v_hat}(g, i) + u_hat c1 + c2_v_hat
+        let [c1, c2_0, c2_1] = garbled_table.inner;
+        let mask = h(&k_u_hat, &k_v_hat);
+
+        assert_eq!(mask.len(), c1.len());
+        assert_eq!(mask.len(), c2_0.len());
+        assert_eq!(mask.len(), c2_1.len());
+
+        let c2 = if v_hat == F2::ZERO { c2_0 } else { c2_1 };
+
+        let body = izip!(mask, c1, c2).map(|(a, b, c)| a ^ b ^ c).collect_vec();
+        let mut body_cursor = Cursor::new(body);
+
+        let mut buf = GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
+
+        // read k^i
+        body_cursor.read_exact(&mut buf).unwrap();
+        let k_i = F128b::from_bytes(&buf).unwrap();
+
+        // read {r^j_i}_{j != i, 1} and then sum everything
+        let r_i_sum = (0..num_parties - 2)
+            .map(|_| {
+                body_cursor.read_exact(&mut buf).unwrap();
+                F128b::from_bytes(&buf).unwrap()
+            })
+            .fold(F128b::ZERO, |acc, x| acc + x);
+
+        // the reader should be empty
+        debug_assert_eq!(0, body_cursor.fill_buf().unwrap().len());
+
+        let r_i_1 = u_hat * lambda_v_delta + lambda_uv_delta + lambda_w_delta;
+        let k_w_hat = k_i + u_hat * k_v_hat + r_i_sum + r_i_1;
+        output_labels.push(k_w_hat);
+    }
+
+    // \hat{w} = b_w + lsb(k^2_\hat{w})
+    let hat_w = b_w + lsb_f128b(&output_labels[0]);
+    (output_labels, hat_w)
 }
 
 impl<P: Preprocessor> Garbler for CopzGarbler<P> {
@@ -212,5 +316,47 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
     fn input_round_3(&self, msg: Self::MR2) -> Self::MR3 {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+    use scuttlebutt::{AesRng, ring::FiniteRing};
+    use swanky_field_binary::{F2, F128b};
+
+    use crate::sharing::{secret_share, secret_share_with_delta};
+
+    use super::encrypt_garbled_table;
+
+    #[test]
+    fn test_encrypt_garbled_table() {
+        let mut rng = AesRng::from_entropy();
+        let n = 3;
+        let lambda_v = F2::random(&mut rng);
+        let lambda_u = F2::random(&mut rng);
+        let lambda_uv = lambda_u * lambda_v;
+        let lambda_w = F2::random(&mut rng);
+        let (lambda_v_shares, deltas) = secret_share::<_, F128b, _>(lambda_v, n, &mut rng);
+        // let lambda_u_shares = secret_share_with_delta::<_, F128b, _>(lambda_u, &deltas, &mut rng);
+        let lambda_uv_shares = secret_share_with_delta::<_, F128b, _>(lambda_uv, &deltas, &mut rng);
+        let lambda_w_shares = secret_share_with_delta::<_, F128b, _>(lambda_w, &deltas, &mut rng);
+
+        let k_u_0 = F128b::random(&mut rng);
+        let k_v_0 = F128b::random(&mut rng);
+        let k_w_0 = F128b::random(&mut rng);
+
+        let _garbled_table = encrypt_garbled_table(
+            &lambda_v_shares[0],
+            &(&lambda_w_shares[0] + &lambda_uv_shares[0]),
+            &(&lambda_w_shares[0] + &lambda_uv_shares[0] + &lambda_w_shares[0]),
+            &k_u_0,
+            &k_v_0,
+            &k_w_0,
+            &deltas[0],
+            0,
+            0,
+            n,
+        );
     }
 }

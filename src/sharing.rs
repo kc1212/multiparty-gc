@@ -207,6 +207,8 @@ where
         .collect()
 }
 
+/// Secret share some `secret` for `n` parties.
+/// Returns shares and deltas
 pub fn secret_share<ShareFF, MacFF, R>(
     secret: ShareFF,
     n: u16,
