@@ -45,6 +45,7 @@ impl MsgRound3 for CopzMsgRound3 {
     }
 }
 
+#[derive(Clone)]
 struct CopzGarbledTable {
     inner: [Vec<u8>; 3],
 }
@@ -81,27 +82,34 @@ fn encrypt_garbled_table(
     party_id: u16,
     num_parties: u16,
 ) -> CopzGarbledTable {
-    let out_len = 128 + (num_parties as usize - 2) * 128;
+    let out_len = (128 + (num_parties as usize - 2) * 128) / 8;
+
     let h = |k_left: &F128b, k_right: &F128b| {
-        // NOTE, we use a single hasher instead of two,
-        // ideally we should use two CCR
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher_left = blake3::Hasher::new();
+        hasher_left.update(&k_left.to_bytes());
+        hasher_left.update(&gate_id.to_le_bytes());
+        hasher_left.update(&party_id.to_le_bytes());
+        let mut xof_reader_left = hasher_left.finalize_xof();
 
-        // first part
-        hasher.update(&k_left.to_bytes());
-        hasher.update(&gate_id.to_le_bytes());
-        hasher.update(&party_id.to_le_bytes());
+        let mut hasher_right = blake3::Hasher::new();
+        hasher_right.update(&k_right.to_bytes());
+        hasher_right.update(&gate_id.to_le_bytes());
+        hasher_right.update(&party_id.to_le_bytes());
+        let mut xof_reader_right = hasher_left.finalize_xof();
 
-        // second part
-        hasher.update(&k_right.to_bytes());
-        hasher.update(&gate_id.to_le_bytes());
-        hasher.update(&party_id.to_le_bytes());
+        let mut h_left = vec![0u8; out_len];
+        xof_reader_left.fill(&mut h_left);
 
-        let mut xof_reader = hasher.finalize_xof();
-        let mut output = vec![0u8; out_len];
-        xof_reader.fill(&mut output);
-        output
+        let mut h_right = vec![0u8; out_len];
+        xof_reader_right.fill(&mut h_right);
+
+        h_left
+            .into_iter()
+            .zip(h_right)
+            .map(|(left, right)| left ^ right)
+            .collect_vec()
     };
+
     // mask_1 = H(k_u_0, gate_id, party_id) + H(k_u_1, gate_id, party_id)
     let mut mask_1 = h(k_u_0, &(k_u_0 + delta));
     // mask_2 = H(k_v_0, gate_id', party_id) + H(k_u_0, gate_id, party_id)
@@ -115,8 +123,8 @@ fn encrypt_garbled_table(
             .unwrap();
         for j in 0..num_parties {
             if j != party_id && j != num_parties - 1 {
-                body.write_all(&r.to_x_delta_i_share(j, delta).to_bytes())
-                    .unwrap();
+                let buf = r.to_x_delta_i_share(j, delta).to_bytes();
+                body.write_all(&buf).unwrap();
             }
         }
         body
@@ -125,6 +133,9 @@ fn encrypt_garbled_table(
     let body_1 = write_body(r1, k_v_0);
     let body_2 = write_body(r2_0, k_w_0);
     let body_3 = write_body(r2_1, k_w_0);
+    assert_eq!(body_1.get_ref().len(), mask_1.len());
+    assert_eq!(body_2.get_ref().len(), mask_2.len());
+    assert_eq!(body_3.get_ref().len(), mask_3.len());
 
     for (m, b) in mask_1.iter_mut().zip(body_1.get_ref()) {
         *m ^= *b;
@@ -146,6 +157,7 @@ fn decrypt_garbled_table(
     k_u_hats: Vec<F128b>,
     k_v_hats: Vec<F128b>,
     lambda_w_delta_i: Vec<F128b>,
+    lambda_u_delta_i: Vec<F128b>,
     lambda_v_delta_i: Vec<F128b>,
     lambda_uv_delta_i: Vec<F128b>,
     u_hat: F2,
@@ -155,36 +167,51 @@ fn decrypt_garbled_table(
     party_id: u16,
     num_parties: u16,
 ) -> (Vec<F128b>, F2) {
-    assert_eq!(garbled_tables.len() - 1, num_parties as usize);
-    let out_len = 128 + (num_parties as usize - 2) * 128;
+    assert_eq!(garbled_tables.len(), num_parties as usize - 1);
+    let out_len = (128 + (num_parties as usize - 2) * 128) / 8;
+
     let h = |k_left: &F128b, k_right: &F128b| {
-        // NOTE, we use a single hasher instead of two,
-        // ideally we should use two CCR
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher_left = blake3::Hasher::new();
+        hasher_left.update(&k_left.to_bytes());
+        hasher_left.update(&gate_id.to_le_bytes());
+        hasher_left.update(&party_id.to_le_bytes());
+        let mut xof_reader_left = hasher_left.finalize_xof();
 
-        // first part
-        hasher.update(&k_left.to_bytes());
-        hasher.update(&gate_id.to_le_bytes());
-        hasher.update(&party_id.to_le_bytes());
+        let mut hasher_right = blake3::Hasher::new();
+        hasher_right.update(&k_right.to_bytes());
+        hasher_right.update(&gate_id.to_le_bytes());
+        hasher_right.update(&party_id.to_le_bytes());
+        let mut xof_reader_right = hasher_left.finalize_xof();
 
-        // second part
-        hasher.update(&k_right.to_bytes());
-        hasher.update(&gate_id.to_le_bytes());
-        hasher.update(&party_id.to_le_bytes());
+        let mut h_left = vec![0u8; out_len];
+        xof_reader_left.fill(&mut h_left);
 
-        let mut xof_reader = hasher.finalize_xof();
-        let mut output = vec![0u8; out_len];
-        xof_reader.fill(&mut output);
-        output
+        let mut h_right = vec![0u8; out_len];
+        xof_reader_right.fill(&mut h_right);
+
+        h_left
+            .into_iter()
+            .zip(h_right)
+            .map(|(left, right)| left ^ right)
+            .collect_vec()
     };
 
     // iterate over i
     let mut output_labels = vec![];
-    for (garbled_table, k_u_hat, k_v_hat, lambda_w_delta, lambda_v_delta, lambda_uv_delta) in izip!(
+    for (
+        garbled_table,
+        k_u_hat,
+        k_v_hat,
+        lambda_w_delta,
+        lambda_u_delta,
+        lambda_v_delta,
+        lambda_uv_delta,
+    ) in izip!(
         garbled_tables,
         k_u_hats,
         k_v_hats,
         lambda_w_delta_i,
+        lambda_u_delta_i,
         lambda_v_delta_i,
         lambda_uv_delta_i
     ) {
@@ -199,7 +226,11 @@ fn decrypt_garbled_table(
 
         let c2 = if v_hat == F2::ZERO { c2_0 } else { c2_1 };
 
-        let body = izip!(mask, c1, c2).map(|(a, b, c)| a ^ b ^ c).collect_vec();
+        let body = if u_hat == F2::ZERO {
+            izip!(mask, c2).map(|(a, c)| a ^ c).collect_vec()
+        } else {
+            izip!(mask, c1, c2).map(|(a, b, c)| a ^ b ^ c).collect_vec()
+        };
         let mut body_cursor = Cursor::new(body);
 
         let mut buf = GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
@@ -219,12 +250,15 @@ fn decrypt_garbled_table(
         // the reader should be empty
         debug_assert_eq!(0, body_cursor.fill_buf().unwrap().len());
 
-        let r_i_1 = u_hat * lambda_v_delta + lambda_uv_delta + lambda_w_delta;
+        let r_i_1 =
+            u_hat * lambda_v_delta + lambda_uv_delta + lambda_w_delta + v_hat * lambda_u_delta;
         let k_w_hat = k_i + u_hat * k_v_hat + r_i_sum + r_i_1;
         output_labels.push(k_w_hat);
     }
 
     // \hat{w} = b_w + lsb(k^2_\hat{w})
+    // NOTE: party at index 0 is the first garbler
+    // (in contrast to party with index 2 in the paper)
     let hat_w = b_w + lsb_f128b(&output_labels[0]);
     (output_labels, hat_w)
 }
@@ -321,35 +355,57 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
     use rand::SeedableRng;
-    use scuttlebutt::{AesRng, ring::FiniteRing};
+    use scuttlebutt::{AesRng, ring::FiniteRing, serialization::CanonicalSerialize};
     use swanky_field_binary::{F2, F128b};
 
-    use crate::sharing::{secret_share, secret_share_with_delta};
+    use crate::{
+        garbler::copz::{decrypt_garbled_table, lsb_f128b},
+        sharing::secret_share_with_delta,
+    };
 
     use super::encrypt_garbled_table;
 
     #[test]
     fn test_encrypt_garbled_table() {
         let mut rng = AesRng::from_entropy();
-        let n = 3;
+        let n = 2;
         let lambda_v = F2::random(&mut rng);
         let lambda_u = F2::random(&mut rng);
         let lambda_uv = lambda_u * lambda_v;
         let lambda_w = F2::random(&mut rng);
-        let (lambda_v_shares, deltas) = secret_share::<_, F128b, _>(lambda_v, n, &mut rng);
-        // let lambda_u_shares = secret_share_with_delta::<_, F128b, _>(lambda_u, &deltas, &mut rng);
+
+        // we need to make the deltas such that lsb(delta[0]) == 1
+        let deltas = {
+            let mut tmp = (0..n).map(|_| F128b::random(&mut rng)).collect_vec();
+            let mut tmp0_buf = tmp[0].to_bytes();
+            tmp0_buf[0] |= 1;
+            tmp[0] = F128b::from_bytes(&tmp0_buf).unwrap();
+            tmp
+        };
+        assert_eq!(lsb_f128b(&deltas[0]), F2::ONE);
+
+        let lambda_v_shares = secret_share_with_delta::<_, F128b, _>(lambda_v, &deltas, &mut rng);
+        let lambda_u_shares = secret_share_with_delta::<_, F128b, _>(lambda_u, &deltas, &mut rng);
         let lambda_uv_shares = secret_share_with_delta::<_, F128b, _>(lambda_uv, &deltas, &mut rng);
         let lambda_w_shares = secret_share_with_delta::<_, F128b, _>(lambda_w, &deltas, &mut rng);
 
         let k_u_0 = F128b::random(&mut rng);
         let k_v_0 = F128b::random(&mut rng);
         let k_w_0 = F128b::random(&mut rng);
+        let b_w = lsb_f128b(&k_w_0);
 
-        let _garbled_table = encrypt_garbled_table(
+        assert_eq!(
+            (&lambda_w_shares[0] + &lambda_uv_shares[0]).to_x_delta_i_share(0, &deltas[0])
+                + (&lambda_w_shares[1] + &lambda_uv_shares[1]).to_x_delta_i_share(0, &deltas[0]),
+            (lambda_w + lambda_uv) * deltas[0]
+        );
+
+        let garbled_table = encrypt_garbled_table(
             &lambda_v_shares[0],
             &(&lambda_w_shares[0] + &lambda_uv_shares[0]),
-            &(&lambda_w_shares[0] + &lambda_uv_shares[0] + &lambda_w_shares[0]),
+            &(&lambda_w_shares[0] + &lambda_uv_shares[0] + &lambda_u_shares[0]),
             &k_u_0,
             &k_v_0,
             &k_w_0,
@@ -358,5 +414,53 @@ mod tests {
             0,
             n,
         );
+
+        for (u_hat, v_hat) in [
+            (F2::ZERO, F2::ZERO),
+            (F2::ZERO, F2::ONE),
+            (F2::ONE, F2::ONE),
+            (F2::ONE, F2::ZERO),
+        ] {
+            println!("testing u_hat={u_hat:?}, v_hat={v_hat:?}");
+
+            let k_u_hat = u_hat * deltas[0] + k_u_0;
+            let k_v_hat = v_hat * deltas[0] + k_v_0;
+
+            // NOTE: party with index 1 is the evaluator
+            let lambda_w_delta_i = lambda_w_shares[1].to_x_delta_shares(&deltas[1]);
+            let lambda_u_delta_i = lambda_u_shares[1].to_x_delta_shares(&deltas[1]);
+            let lambda_v_delta_i = lambda_v_shares[1].to_x_delta_shares(&deltas[1]);
+            let lambda_uv_delta_i = lambda_uv_shares[1].to_x_delta_shares(&deltas[1]);
+
+            let (k_w_hat, w_hat) = decrypt_garbled_table(
+                vec![garbled_table.clone()],
+                vec![k_u_hat],
+                vec![k_v_hat],
+                lambda_w_delta_i,
+                lambda_u_delta_i,
+                lambda_v_delta_i,
+                lambda_uv_delta_i,
+                u_hat,
+                v_hat,
+                b_w,
+                0,
+                0,
+                n,
+            );
+            assert_eq!(k_w_hat.len(), 1);
+
+            let k_w_hat = k_w_hat[0];
+            if k_w_hat == k_w_0 {
+                assert_eq!(w_hat, F2::ZERO);
+            } else {
+                assert_eq!(w_hat, F2::ONE);
+            }
+            assert_eq!(
+                k_w_hat,
+                (u_hat * v_hat + u_hat * lambda_v + lambda_w + lambda_uv + v_hat * lambda_u)
+                    * deltas[0]
+                    + k_w_0
+            );
+        }
     }
 }
