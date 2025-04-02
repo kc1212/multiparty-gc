@@ -1,66 +1,56 @@
 use bristol_fashion::{Circuit, Gate};
-use itertools::{Itertools, izip};
+use itertools::Itertools;
 use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    error::GcError,
-    garbler::wrk17::{Wrk17EvaluatorOutput, Wrk17Garbling, decrypt_garbled_gate},
+    garbler::copz::{CopzGarbling, decrypt_garbled_gate},
     sharing::AuthShare,
     transpose,
 };
 
 use super::Evaluator;
 
-pub struct Wrk17Evaluator {
-    total_num_parties: u16,
+pub struct CopzEvaluator {
+    num_parties: u16,
     /// Ordererd by topological order of AND gate
-    /// r^1_{\gamma, \ell}, {M_j[r^1_{\gamma, \ell}]}, {K_1[r^j_{\gamma, \ell}]}
+    /// [\lambda_u], [\lambda_v], [\lambda_uv], [\lambda_w]
     garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
     /// Shares of the final output wire masks \lambda_w,
     /// w are the circuit output wires
+    /// (some of this is redundant, covered by [garbling_shares])
     wire_mask_shares: Vec<AuthShare<F2, F128b>>,
     delta: F128b,
+    /// Received from the first garbler,
+    /// which are values b_w = lsb(k^2_{w,0}).
+    b_ws: Vec<F2>,
 }
 
-pub struct Wrk17EncodedOutput {
+pub struct CopzEncodedOutput {
     masked_output_values: Vec<F2>,
 }
 
-impl Evaluator for Wrk17Evaluator {
-    type Gc = Wrk17Garbling;
+impl Evaluator for CopzEvaluator {
+    type Gc = CopzGarbling;
     type Label = F128b;
-    type GarbledOutput = Wrk17EncodedOutput;
+    type GarbledOutput = CopzEncodedOutput;
 
     // To decode, each party needs to send
     // { (r^i_w, M_1[r^i_w]) } to the evaluator
     // inner[i][j] is the ith wire and jth party
     type Decoder = Vec<(F2, F128b)>;
 
-    fn from_garbling(garbling: Wrk17Garbling) -> Self {
-        let Wrk17EvaluatorOutput {
-            total_num_parties,
-            garbling_shares,
-            wire_mask_shares,
-            delta,
-        } = garbling.get_evaluator_gates();
-
-        Self {
-            total_num_parties,
-            garbling_shares,
-            wire_mask_shares,
-            delta,
-        }
+    fn from_garbling(garbling: CopzGarbling) -> Self {
+        todo!()
     }
 
-    /// `input_labels` - input_labels[i][j] means party i wire j
     fn eval(
         &self,
         circuit: &Circuit,
-        garblings: Vec<Wrk17Garbling>, // one per party
+        garblings: Vec<CopzGarbling>,
         masked_inputs: Vec<F2>,
-        input_labels: Vec<Vec<F128b>>, // indexed by party and then by wire
-    ) -> Result<Wrk17EncodedOutput, GcError> {
+        input_labels: Vec<Vec<F128b>>,
+    ) -> Result<Self::GarbledOutput, crate::error::GcError> {
         // party with index n - 1 is the evaluator
         let party_count = garblings.len() + 1;
         let input_len: u64 = circuit.input_sizes().iter().sum();
@@ -114,38 +104,27 @@ impl Evaluator for Wrk17Evaluator {
                 Gate::AND { a, b, out } => {
                     let alpha = masked_wire_values[*a as usize];
                     let beta = masked_wire_values[*b as usize];
-                    #[cfg(test)]
-                    {
-                        println!(
-                            "Evaluating {and_gate_ctr}-th AND gate with a={a}, masked_a={:?}, b={b}, masked_b={:?}, gamma={out}",
-                            alpha, beta
-                        );
-                        let mut row0 = self.garbling_shares[and_gate_ctr][0].share;
-                        let mut row1 = self.garbling_shares[and_gate_ctr][1].share;
-                        let mut row2 = self.garbling_shares[and_gate_ctr][2].share;
-                        let mut row3 = self.garbling_shares[and_gate_ctr][3].share;
-                        for row in &garblings[and_gate_ctr] {
-                            row0 += row.unencrypted_rows[0].share;
-                            row1 += row.unencrypted_rows[1].share;
-                            row2 += row.unencrypted_rows[2].share;
-                            row3 += row.unencrypted_rows[3].share;
-                        }
-                        println!("\trows: ({row0:?}, {row1:?}, {row2:?}, {row3:?})");
-                        println!(
-                            "\tlabels: {:?}, {:?}",
-                            labels[*a as usize], labels[*b as usize]
-                        );
-                    }
+                    let [lambda_u, lambda_v, lambda_uv, lambda_w] =
+                        &self.garbling_shares[and_gate_ctr];
+
+                    let lambda_w_delta_i = lambda_u.to_x_delta_shares(&self.delta);
+                    let lambda_u_delta_i = lambda_v.to_x_delta_shares(&self.delta);
+                    let lambda_v_delta_i = lambda_uv.to_x_delta_shares(&self.delta);
+                    let lambda_uv_delta_i = lambda_w.to_x_delta_shares(&self.delta);
                     let (new_share, new_labels) = decrypt_garbled_gate(
                         &garblings[and_gate_ctr],
-                        alpha,
-                        beta,
                         &labels[*a as usize],
                         &labels[*b as usize],
+                        &lambda_w_delta_i,
+                        &lambda_u_delta_i,
+                        &lambda_v_delta_i,
+                        &lambda_uv_delta_i,
+                        alpha,
+                        beta,
+                        self.b_ws[and_gate_ctr],
                         *out,
-                        &self.garbling_shares[and_gate_ctr],
-                        self.delta,
-                    )?;
+                        self.num_parties,
+                    );
                     masked_wire_values[*out as usize] = new_share;
                     #[cfg(test)]
                     {
@@ -176,74 +155,16 @@ impl Evaluator for Wrk17Evaluator {
             masked_output_values.push(masked_wire_values[out as usize]);
         }
 
-        Ok(Wrk17EncodedOutput {
+        Ok(CopzEncodedOutput {
             masked_output_values,
         })
     }
 
-    /// - `decoder`: decoder[i][w] where i is the party and w is the wire
     fn decode(
         &self,
-        encoded: Wrk17EncodedOutput,
-        decoder: Vec<Vec<(F2, F128b)>>,
-    ) -> Result<Vec<F2>, GcError> {
-        if decoder.len() != self.total_num_parties as usize - 1 {
-            eprintln!("decoder.len != total_num_parties - 1");
-            return Err(GcError::DecoderLengthError);
-        }
-        if encoded.masked_output_values.len() != decoder[0].len() {
-            eprintln!("masked_output_values.len != decoder[0].len()");
-            return Err(GcError::DecoderLengthError);
-        }
-        if encoded.masked_output_values.len() != self.wire_mask_shares.len() {
-            eprintln!("masked_output_values.len != wire_mask_shares.len()");
-            return Err(GcError::DecoderLengthError);
-        }
-
-        let decoder = transpose(decoder);
-
-        let mut _check_count = 0;
-        // Iterate over the wires
-        for (all_shares_macs, key) in decoder.iter().zip(&self.wire_mask_shares) {
-            // Iterate over the parties
-            for (i, (share, mac)) in all_shares_macs.iter().enumerate() {
-                // r^i_w, M_1[r^i_w], K_1[r^i_w] is valid
-                let key = key.mac_keys[&(i as u16)];
-                if *share * self.delta + key != *mac {
-                    return Err(GcError::DecoderCheckFailure);
-                }
-                #[cfg(test)]
-                {
-                    _check_count += 1usize;
-                }
-            }
-        }
-        #[cfg(test)]
-        {
-            println!("{_check_count} decoder checks passed");
-        }
-
-        assert_eq!(decoder.len(), encoded.masked_output_values.len());
-
-        // reconstruct the shares, note that we need all shares
-        let res = izip!(
-            encoded.masked_output_values,
-            decoder,
-            &self.wire_mask_shares
-        )
-        .map(|(masked_output, mask_shares, evaluator_share)| {
-            let mask = mask_shares
-                .into_iter()
-                .map(|inner| inner.0)
-                .fold(F2::ZERO, |acc, x| acc + x)
-                + evaluator_share.share;
-            #[cfg(test)]
-            {
-                println!("reconstructed output mask: {mask:?}");
-            }
-            masked_output + mask
-        })
-        .collect_vec();
-        Ok(res)
+        encoded: Self::GarbledOutput,
+        decoder: Vec<Self::Decoder>,
+    ) -> Result<Vec<F2>, crate::error::GcError> {
+        todo!()
     }
 }

@@ -4,6 +4,7 @@ use swanky_field_binary::F2;
 
 use crate::{error::GcError, garbler::Garbling};
 
+pub mod copz;
 pub mod wrk17;
 
 pub trait Evaluator {

@@ -22,8 +22,36 @@ pub struct CopzGarbler<P: Preprocessor> {
     delta: F128b,
 }
 
-pub enum CopzGarbling {}
+pub struct CopzEvaluatorOutput {
+    pub(crate) total_num_parties: u16,
+    pub(crate) garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
+    /// The authenticated bits of the wire masks \lambda_w of the output wires.
+    pub(crate) wire_mask_shares: Vec<AuthShare<F2, F128b>>,
+    pub(crate) delta: F128b,
+}
+
+pub enum CopzGarbling {
+    Garbler(Vec<CopzGarbledGate>),
+    Evaluator(CopzEvaluatorOutput),
+}
+
 impl Garbling for CopzGarbling {}
+
+impl CopzGarbling {
+    pub fn get_garbler_gates(self) -> Vec<CopzGarbledGate> {
+        match self {
+            CopzGarbling::Garbler(inner) => inner,
+            CopzGarbling::Evaluator(_) => panic!("not a garbler"),
+        }
+    }
+
+    pub fn get_evaluator_gates(self) -> CopzEvaluatorOutput {
+        match self {
+            CopzGarbling::Garbler(_) => panic!("not an evaluator"),
+            CopzGarbling::Evaluator(inner) => inner,
+        }
+    }
+}
 
 pub struct CopzMsgRound1 {}
 impl MsgRound1 for CopzMsgRound1 {}
@@ -46,7 +74,7 @@ impl MsgRound3 for CopzMsgRound3 {
 }
 
 #[derive(Clone)]
-struct CopzGarbledTable {
+pub struct CopzGarbledGate {
     inner: [Vec<u8>; 3],
 }
 
@@ -81,7 +109,7 @@ fn encrypt_garbled_table(
     gate_id: u64,
     party_id: u16,
     num_parties: u16,
-) -> CopzGarbledTable {
+) -> CopzGarbledGate {
     let out_len = (128 + (num_parties as usize - 2) * 128) / 8;
 
     let h = |k_left: &F128b, k_right: &F128b| {
@@ -147,30 +175,29 @@ fn encrypt_garbled_table(
         *m ^= *b;
     }
 
-    CopzGarbledTable {
+    CopzGarbledGate {
         inner: [mask_1, mask_2, mask_3],
     }
 }
 
-fn decrypt_garbled_table(
-    garbled_tables: Vec<CopzGarbledTable>,
-    k_u_hats: Vec<F128b>,
-    k_v_hats: Vec<F128b>,
-    lambda_w_delta_i: Vec<F128b>,
-    lambda_u_delta_i: Vec<F128b>,
-    lambda_v_delta_i: Vec<F128b>,
-    lambda_uv_delta_i: Vec<F128b>,
+pub(crate) fn decrypt_garbled_gate(
+    garbled_tables: &[CopzGarbledGate],
+    k_u_hats: &[F128b],
+    k_v_hats: &[F128b],
+    lambda_w_delta_i: &[F128b],
+    lambda_u_delta_i: &[F128b],
+    lambda_v_delta_i: &[F128b],
+    lambda_uv_delta_i: &[F128b],
     u_hat: F2,
     v_hat: F2,
     b_w: F2,
     gate_id: u64,
-    party_id: u16,
     num_parties: u16,
-) -> (Vec<F128b>, F2) {
+) -> (F2, Vec<F128b>) {
     assert_eq!(garbled_tables.len(), num_parties as usize - 1);
     let out_len = (128 + (num_parties as usize - 2) * 128) / 8;
 
-    let h = |k_left: &F128b, k_right: &F128b| {
+    let h = |k_left: &F128b, k_right: &F128b, party_id: u16| {
         let mut hasher_left = blake3::Hasher::new();
         hasher_left.update(&k_left.to_bytes());
         hasher_left.update(&gate_id.to_le_bytes());
@@ -199,13 +226,16 @@ fn decrypt_garbled_table(
     // iterate over i
     let mut output_labels = vec![];
     for (
-        garbled_table,
-        k_u_hat,
-        k_v_hat,
-        lambda_w_delta,
-        lambda_u_delta,
-        lambda_v_delta,
-        lambda_uv_delta,
+        party_id,
+        (
+            garbled_table,
+            k_u_hat,
+            k_v_hat,
+            lambda_w_delta,
+            lambda_u_delta,
+            lambda_v_delta,
+            lambda_uv_delta,
+        ),
     ) in izip!(
         garbled_tables,
         k_u_hats,
@@ -214,11 +244,13 @@ fn decrypt_garbled_table(
         lambda_u_delta_i,
         lambda_v_delta_i,
         lambda_uv_delta_i
-    ) {
+    )
+    .enumerate()
+    {
         // (k^i || {r^j_i}_{j != i, 1}) :=
         // F_{k_u_hat}(g, i) + F_{k_v_hat}(g, i) + u_hat c1 + c2_v_hat
-        let [c1, c2_0, c2_1] = garbled_table.inner;
-        let mask = h(&k_u_hat, &k_v_hat);
+        let [c1, c2_0, c2_1] = &garbled_table.inner;
+        let mask = h(&k_u_hat, &k_v_hat, party_id as u16);
 
         assert_eq!(mask.len(), c1.len());
         assert_eq!(mask.len(), c2_0.len());
@@ -251,8 +283,8 @@ fn decrypt_garbled_table(
         debug_assert_eq!(0, body_cursor.fill_buf().unwrap().len());
 
         let r_i_1 =
-            u_hat * lambda_v_delta + lambda_uv_delta + lambda_w_delta + v_hat * lambda_u_delta;
-        let k_w_hat = k_i + u_hat * k_v_hat + r_i_sum + r_i_1;
+            u_hat * *lambda_v_delta + lambda_uv_delta + lambda_w_delta + v_hat * *lambda_u_delta;
+        let k_w_hat = k_i + u_hat * *k_v_hat + r_i_sum + r_i_1;
         output_labels.push(k_w_hat);
     }
 
@@ -260,7 +292,7 @@ fn decrypt_garbled_table(
     // NOTE: party at index 0 is the first garbler
     // (in contrast to party with index 2 in the paper)
     let hat_w = b_w + lsb_f128b(&output_labels[0]);
-    (output_labels, hat_w)
+    (hat_w, output_labels)
 }
 
 impl<P: Preprocessor> Garbler for CopzGarbler<P> {
@@ -280,18 +312,43 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         if self.party_id == 1 {
             assert_eq!(delta.to_bytes()[0] & 1, 1);
         }
-        let auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
-        let wire_labels = self.gen_labels(rng, circuit);
+        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
+        let mut wire_labels = self.gen_labels(rng, circuit);
+
+        let and_gate_count = circuit.nand();
+        let mut garbler_output = Vec::with_capacity(if self.is_garbler() {
+            and_gate_count as usize
+        } else {
+            0
+        });
+        let mut eval_output = Vec::with_capacity(if self.is_garbler() {
+            0
+        } else {
+            and_gate_count as usize
+        });
 
         for gate in circuit.gates() {
             match gate {
-                Gate::XOR { a, b, out } => todo!(),
-                Gate::INV { a, out } => todo!(),
+                Gate::XOR { a, b, out } => {
+                    let output_share = &auth_bits[a] + &auth_bits[b];
+                    assert!(!auth_bits.contains_key(out));
+                    auth_bits.insert(*out, output_share);
+                    if self.is_garbler() {
+                        assert!(!wire_labels.contains_key(out));
+                        wire_labels.insert(*out, wire_labels[a] + wire_labels[b]);
+                    }
+                }
+                Gate::INV { a, out } => {
+                    if self.is_garbler() {
+                        wire_labels.insert(*out, wire_labels[a] + delta);
+                    }
+                    auth_bits.insert(*out, auth_bits[a].clone());
+                }
                 Gate::AND { a, b, out } => {
-                    let bit_a = &auth_bits[a];
-                    let bit_b = &auth_bits[b];
-                    let bit_out = &auth_bits[out];
-                    let bit_prod = self.preprocessor.auth_mul(bit_a, bit_b).unwrap();
+                    let lambda_u = &auth_bits[a];
+                    let lambda_v = &auth_bits[b];
+                    let lambda_uv = &auth_bits[out];
+                    let lambda_w = self.preprocessor.auth_mul(lambda_u, lambda_v).unwrap();
 
                     /*
                     // <\lambda_u \Delta_j>, j \in [n]
@@ -304,32 +361,58 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                     let uv_delta_js = bit_prod.to_x_delta_shares(&delta);
                     */
 
-                    let r1 = bit_b;
-                    let r2_0 = bit_out + &bit_prod;
-                    let r2_1 = &r2_0 + bit_a;
+                    let r1 = lambda_v;
+                    let r2_0 = lambda_uv + &lambda_w;
+                    let r2_1 = &r2_0 + lambda_u;
 
-                    let k_u_0 = wire_labels[a];
-                    let k_v_0 = wire_labels[b];
-                    let k_w_0 = wire_labels[out];
-                    let garbled_table = encrypt_garbled_table(
-                        r1,
-                        &r2_0,
-                        &r2_1,
-                        &k_u_0,
-                        &k_v_0,
-                        &k_w_0,
-                        &delta,
-                        *out,
-                        self.party_id,
-                        self.num_parties,
-                    );
+                    if self.is_garbler() {
+                        let k_u_0 = wire_labels[a];
+                        let k_v_0 = wire_labels[b];
+                        let k_w_0 = wire_labels[out];
+                        let garbled_table = encrypt_garbled_table(
+                            r1,
+                            &r2_0,
+                            &r2_1,
+                            &k_u_0,
+                            &k_v_0,
+                            &k_w_0,
+                            &delta,
+                            *out,
+                            self.party_id,
+                            self.num_parties,
+                        );
+                        garbler_output.push(garbled_table);
+                    } else {
+                        eval_output.push([
+                            lambda_u.clone(),
+                            lambda_v.clone(),
+                            lambda_uv.clone(),
+                            lambda_w.clone(),
+                        ]);
+                    }
                 }
                 Gate::EQ { lit: _, out: _ } => unimplemented!("EQ gate not supported"),
                 Gate::EQW { a: _, out: _ } => unimplemented!("EQW gate not supported"),
             }
         }
 
-        todo!()
+        self.preprocessor.done();
+
+        if self.is_garbler() {
+            CopzGarbling::Garbler(garbler_output)
+        } else {
+            let output_wire_count: u64 = circuit.output_sizes().iter().sum();
+            let nwires = circuit.nwires();
+            debug_assert_eq!(nwires as usize, auth_bits.len());
+            CopzGarbling::Evaluator(CopzEvaluatorOutput {
+                total_num_parties: self.num_parties,
+                garbling_shares: eval_output,
+                wire_mask_shares: (nwires - output_wire_count..nwires)
+                    .map(|i| auth_bits[&i].clone())
+                    .collect(),
+                delta,
+            })
+        }
     }
 
     fn party_id(&self) -> u16 {
@@ -361,7 +444,7 @@ mod tests {
     use swanky_field_binary::{F2, F128b};
 
     use crate::{
-        garbler::copz::{decrypt_garbled_table, lsb_f128b},
+        garbler::copz::{decrypt_garbled_gate, lsb_f128b},
         sharing::secret_share_with_delta,
     };
 
@@ -432,18 +515,17 @@ mod tests {
             let lambda_v_delta_i = lambda_v_shares[1].to_x_delta_shares(&deltas[1]);
             let lambda_uv_delta_i = lambda_uv_shares[1].to_x_delta_shares(&deltas[1]);
 
-            let (k_w_hat, w_hat) = decrypt_garbled_table(
-                vec![garbled_table.clone()],
-                vec![k_u_hat],
-                vec![k_v_hat],
-                lambda_w_delta_i,
-                lambda_u_delta_i,
-                lambda_v_delta_i,
-                lambda_uv_delta_i,
+            let (w_hat, k_w_hat) = decrypt_garbled_gate(
+                &vec![garbled_table.clone()],
+                &vec![k_u_hat],
+                &vec![k_v_hat],
+                &lambda_w_delta_i,
+                &lambda_u_delta_i,
+                &lambda_v_delta_i,
+                &lambda_uv_delta_i,
                 u_hat,
                 v_hat,
                 b_w,
-                0,
                 0,
                 n,
             );

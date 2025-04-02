@@ -1,5 +1,11 @@
 use swanky_field_binary::{F2, F128b};
 
+pub mod error;
+pub mod evaluator;
+pub mod garbler;
+pub mod prep;
+pub mod sharing;
+
 pub trait GcPrf {
     fn run(&self, key: F128b, player: usize, gate: usize) -> F128b;
 }
@@ -16,11 +22,19 @@ pub trait MsgRound3 {
     fn into_labels_and_decoder(self) -> (Vec<F128b>, Self::Decoder);
 }
 
-pub mod error;
-pub mod evaluator;
-pub mod garbler;
-pub mod prep;
-pub mod sharing;
+pub(crate) fn transpose<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
+    assert!(!v.is_empty());
+    let len = v[0].len();
+    let mut iters: Vec<_> = v.into_iter().map(|n| n.into_iter()).collect();
+    (0..len)
+        .map(|_| {
+            iters
+                .iter_mut()
+                .map(|n| n.next().unwrap())
+                .collect::<Vec<T>>()
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod test {
