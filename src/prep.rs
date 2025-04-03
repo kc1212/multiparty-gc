@@ -79,6 +79,7 @@ impl InsecurePreprocessorReq {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn take_triple(self) -> Result<(AuthShare<F2, F128b>, AuthShare<F2, F128b>), GcError> {
         match self {
             InsecurePreprocessorReq::Triple(_, t) => Ok(t),

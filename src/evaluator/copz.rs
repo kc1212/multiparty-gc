@@ -1,10 +1,11 @@
 use bristol_fashion::{Circuit, Gate};
-use itertools::Itertools;
+use itertools::{Itertools, izip};
 use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    garbler::copz::{CopzGarbling, decrypt_garbled_gate},
+    error::GcError,
+    garbler::copz::{CopzEvaluatorOutput, CopzGarbling, decrypt_garbled_gate},
     sharing::AuthShare,
     transpose,
 };
@@ -21,9 +22,6 @@ pub struct CopzEvaluator {
     /// (some of this is redundant, covered by [garbling_shares])
     wire_mask_shares: Vec<AuthShare<F2, F128b>>,
     delta: F128b,
-    /// Received from the first garbler,
-    /// which are values b_w = lsb(k^2_{w,0}).
-    b_ws: Vec<F2>,
 }
 
 pub struct CopzEncodedOutput {
@@ -35,13 +33,22 @@ impl Evaluator for CopzEvaluator {
     type Label = F128b;
     type GarbledOutput = CopzEncodedOutput;
 
-    // To decode, each party needs to send
-    // { (r^i_w, M_1[r^i_w]) } to the evaluator
-    // inner[i][j] is the ith wire and jth party
-    type Decoder = Vec<(F2, F128b)>;
+    // To decode, each party needs to send the output wire masks.
+    type Decoder = Vec<F2>;
 
     fn from_garbling(garbling: CopzGarbling) -> Self {
-        todo!()
+        let CopzEvaluatorOutput {
+            num_parties: total_num_parties,
+            garbling_shares,
+            wire_mask_shares,
+            delta,
+        } = garbling.get_evaluator_gates();
+        Self {
+            num_parties: total_num_parties,
+            garbling_shares,
+            wire_mask_shares,
+            delta,
+        }
     }
 
     fn eval(
@@ -71,6 +78,10 @@ impl Evaluator for CopzEvaluator {
                 .map(|labels| [labels, vec![F128b::ZERO; gate_count]].concat())
                 .collect(),
         );
+
+        // Received from the first garbler,
+        // which are values b_w = lsb(k^2_{w,0}).
+        let b_ws = garblings[0].get_b_w();
 
         // We iterate over the gates, so we need to transpose `garblings`
         // since we need the garbled gates from all parties to evaluate one gate.
@@ -121,7 +132,7 @@ impl Evaluator for CopzEvaluator {
                         &lambda_uv_delta_i,
                         alpha,
                         beta,
-                        self.b_ws[and_gate_ctr],
+                        b_ws[and_gate_ctr],
                         *out,
                         self.num_parties,
                     );
@@ -162,9 +173,39 @@ impl Evaluator for CopzEvaluator {
 
     fn decode(
         &self,
-        encoded: Self::GarbledOutput,
-        decoder: Vec<Self::Decoder>,
-    ) -> Result<Vec<F2>, crate::error::GcError> {
-        todo!()
+        encoded: CopzEncodedOutput,
+        decoder: Vec<Vec<F2>>,
+    ) -> Result<Vec<F2>, GcError> {
+        if decoder.len() != self.num_parties as usize - 1 {
+            eprintln!("decoder.len != num_parties - 1");
+            return Err(GcError::DecoderLengthError);
+        }
+        if encoded.masked_output_values.len() != decoder[0].len() {
+            eprintln!("masked_output_values.len != decoder[0].len()");
+            return Err(GcError::DecoderLengthError);
+        }
+        if encoded.masked_output_values.len() != self.wire_mask_shares.len() {
+            eprintln!("masked_output_values.len != wire_mask_shares.len()");
+            return Err(GcError::DecoderLengthError);
+        }
+
+        let decoder = transpose(decoder);
+
+        let res = izip!(
+            encoded.masked_output_values,
+            decoder,
+            &self.wire_mask_shares
+        )
+        .map(|(masked_output, mask_shares, evaluator_share)| {
+            let mask =
+                mask_shares.into_iter().fold(F2::ZERO, |acc, x| acc + x) + evaluator_share.share;
+            #[cfg(test)]
+            {
+                println!("reconstructed output mask: {mask:?}");
+            }
+            masked_output + mask
+        })
+        .collect_vec();
+        Ok(res)
     }
 }

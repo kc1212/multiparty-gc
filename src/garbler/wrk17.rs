@@ -39,10 +39,10 @@ pub struct Wrk17Garbler<P: Preprocessor> {
 }
 
 impl<P: Preprocessor> Wrk17Garbler<P> {
-    pub fn new(party_id: u16, total_num_parties: u16, preprocessor: P) -> Self {
+    pub fn new(party_id: u16, num_parties: u16, preprocessor: P) -> Self {
         Self {
             party_id,
-            num_parties: total_num_parties,
+            num_parties,
             preprocessor,
             delta: F128b::ZERO,
             input_shares: vec![],
@@ -217,6 +217,7 @@ impl Index<u8> for Wrk17GarbledGate {
 /// - `evaluator_shares`: shares produced by the evaluator during garbling, i.e.,
 ///   r^1_{\gamma, \ell}, { M_j[r^1_{\gamma, \ell}], K_1[r^i_{\gamma, \ell}] }
 /// - `evaluator_delta`: the delta of the evaluator
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decrypt_garbled_gate(
     garbled_gates: &[Wrk17GarbledGate],
     a: F2,
@@ -504,6 +505,10 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         let input_wire_count: u64 = circuit.input_sizes().iter().sum();
         self.delta = delta;
         for input_idx in 0..input_wire_count {
+            // Shared by garblers and evaluator
+            let r = auth_bits[&input_idx].share;
+            self.input_shares.push(r);
+
             if !self.is_garbler() {
                 // TODO avoid clone?
                 self.input_keys.push(
@@ -513,12 +518,8 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                         .cloned()
                         .collect_vec(),
                 );
-                let r = auth_bits[&input_idx].share;
-                self.input_shares.push(r);
             } else {
-                let r = auth_bits[&input_idx].share;
                 let mac = auth_bits[&input_idx].mac_values[&(&self.num_parties - 1)];
-                self.input_shares.push(r);
                 self.input_macs.push(mac);
 
                 let label = wire_labels[&input_idx];

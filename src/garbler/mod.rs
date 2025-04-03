@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use bristol_fashion::{Circuit, circuits};
+use bristol_fashion::Circuit;
 use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};

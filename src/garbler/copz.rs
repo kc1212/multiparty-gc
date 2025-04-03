@@ -20,10 +20,32 @@ pub struct CopzGarbler<P: Preprocessor> {
     preprocessor: P,
 
     delta: F128b,
+
+    input_shares: Vec<F2>,
+
+    // Input labels created by the garbler.
+    input_labels: Vec<F128b>,
+
+    // This is for the output decoder, basically the output wire masks.
+    output_decoder: Vec<F2>,
+}
+
+impl<P: Preprocessor> CopzGarbler<P> {
+    pub fn new(party_id: u16, num_parties: u16, preprocessor: P) -> Self {
+        Self {
+            party_id,
+            num_parties,
+            preprocessor,
+            delta: F128b::ZERO,
+            input_shares: vec![],
+            input_labels: vec![],
+            output_decoder: vec![],
+        }
+    }
 }
 
 pub struct CopzEvaluatorOutput {
-    pub(crate) total_num_parties: u16,
+    pub(crate) num_parties: u16,
     pub(crate) garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
     /// The authenticated bits of the wire masks \lambda_w of the output wires.
     pub(crate) wire_mask_shares: Vec<AuthShare<F2, F128b>>,
@@ -31,7 +53,7 @@ pub struct CopzEvaluatorOutput {
 }
 
 pub enum CopzGarbling {
-    Garbler(Vec<CopzGarbledGate>),
+    Garbler((Vec<CopzGarbledGate>, Option<Vec<F2>>)),
     Evaluator(CopzEvaluatorOutput),
 }
 
@@ -40,7 +62,7 @@ impl Garbling for CopzGarbling {}
 impl CopzGarbling {
     pub fn get_garbler_gates(self) -> Vec<CopzGarbledGate> {
         match self {
-            CopzGarbling::Garbler(inner) => inner,
+            CopzGarbling::Garbler(inner) => inner.0,
             CopzGarbling::Evaluator(_) => panic!("not a garbler"),
         }
     }
@@ -51,25 +73,42 @@ impl CopzGarbling {
             CopzGarbling::Evaluator(inner) => inner,
         }
     }
-}
 
-pub struct CopzMsgRound1 {}
-impl MsgRound1 for CopzMsgRound1 {}
-
-#[derive(Clone)]
-pub struct CopzMsgRound2 {}
-impl MsgRound2 for CopzMsgRound2 {
-    fn into_masked_inputs(self) -> Vec<F2> {
-        todo!()
+    pub fn get_b_w(&self) -> Vec<F2> {
+        match self {
+            CopzGarbling::Garbler(inner) => inner.1.clone().expect("b_w is None"),
+            CopzGarbling::Evaluator(_) => panic!("not a garbler"),
+        }
     }
 }
 
-pub struct CopzMsgRound3 {}
+pub struct CopzMsgRound1 {
+    shares: Vec<F2>,
+}
+
+impl MsgRound1 for CopzMsgRound1 {}
+
+#[derive(Clone)]
+pub struct CopzMsgRound2 {
+    masked_inputs: Vec<F2>,
+}
+
+impl MsgRound2 for CopzMsgRound2 {
+    fn into_masked_inputs(self) -> Vec<F2> {
+        self.masked_inputs
+    }
+}
+
+pub struct CopzMsgRound3 {
+    labels: Vec<F128b>,
+    output_decoder: Vec<F2>,
+}
+
 impl MsgRound3 for CopzMsgRound3 {
-    type Decoder = Vec<(F2, F128b)>;
+    type Decoder = Vec<F2>;
 
     fn into_labels_and_decoder(self) -> (Vec<F128b>, Self::Decoder) {
-        todo!()
+        (self.labels, self.output_decoder)
     }
 }
 
@@ -98,6 +137,7 @@ fn lsb_f128b(x: &F128b) -> F2 {
 /// - `party_id`:
 /// - `num_parties`: the number of parties,
 ///   should be consistent with the MACs/Keys in the authenticated shares
+#[allow(clippy::too_many_arguments)]
 fn encrypt_garbled_table(
     r1: &AuthShare<F2, F128b>,
     r2_0: &AuthShare<F2, F128b>,
@@ -180,6 +220,7 @@ fn encrypt_garbled_table(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decrypt_garbled_gate(
     garbled_tables: &[CopzGarbledGate],
     k_u_hats: &[F128b],
@@ -250,7 +291,7 @@ pub(crate) fn decrypt_garbled_gate(
         // (k^i || {r^j_i}_{j != i, 1}) :=
         // F_{k_u_hat}(g, i) + F_{k_v_hat}(g, i) + u_hat c1 + c2_v_hat
         let [c1, c2_0, c2_1] = &garbled_table.inner;
-        let mask = h(&k_u_hat, &k_v_hat, party_id as u16);
+        let mask = h(k_u_hat, k_v_hat, party_id as u16);
 
         assert_eq!(mask.len(), c1.len());
         assert_eq!(mask.len(), c2_0.len());
@@ -316,15 +357,24 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         let mut wire_labels = self.gen_labels(rng, circuit);
 
         let and_gate_count = circuit.nand();
+
         let mut garbler_output = Vec::with_capacity(if self.is_garbler() {
             and_gate_count as usize
         } else {
             0
         });
+
         let mut eval_output = Vec::with_capacity(if self.is_garbler() {
             0
         } else {
             and_gate_count as usize
+        });
+
+        // This is the b_w that only party 0 stores (party 2 in the paper)
+        let mut b_w_output = Vec::with_capacity(if self.party_id == 0 {
+            and_gate_count as usize
+        } else {
+            0
         });
 
         for gate in circuit.gates() {
@@ -382,6 +432,10 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                             self.num_parties,
                         );
                         garbler_output.push(garbled_table);
+
+                        if self.party_id == 0 {
+                            b_w_output.push(lsb_f128b(&k_w_0));
+                        }
                     } else {
                         eval_output.push([
                             lambda_u.clone(),
@@ -398,14 +452,38 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
         self.preprocessor.done();
 
+        // Keep some information that we need for inputs
+        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
+        for input_idx in 0..input_wire_count {
+            let r = auth_bits[&input_idx].share;
+            self.input_shares.push(r);
+
+            if !self.is_garbler() {
+            } else {
+                let label = wire_labels[&input_idx];
+                self.input_labels.push(label);
+            }
+        }
+
+        // Keep some information we need for outputs
+        let output_wire_count: u64 = circuit.output_sizes().iter().sum();
+        let nwires = circuit.nwires();
         if self.is_garbler() {
-            CopzGarbling::Garbler(garbler_output)
+            self.output_decoder = (nwires - output_wire_count..nwires)
+                .map(|i| auth_bits[&i].share)
+                .collect();
+        }
+
+        if self.is_garbler() {
+            if self.party_id == 0 {
+                CopzGarbling::Garbler((garbler_output, Some(b_w_output)))
+            } else {
+                CopzGarbling::Garbler((garbler_output, None))
+            }
         } else {
-            let output_wire_count: u64 = circuit.output_sizes().iter().sum();
-            let nwires = circuit.nwires();
             debug_assert_eq!(nwires as usize, auth_bits.len());
             CopzGarbling::Evaluator(CopzEvaluatorOutput {
-                total_num_parties: self.num_parties,
+                num_parties: self.num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
                     .map(|i| auth_bits[&i].clone())
@@ -419,20 +497,70 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         self.party_id
     }
 
-    fn input_round_1(&self) -> Self::MR1 {
-        todo!()
+    fn input_round_1(&self) -> CopzMsgRound1 {
+        // Only the garbler can all this function
+        assert!(self.party_id != self.num_parties - 1);
+
+        CopzMsgRound1 {
+            shares: self.input_shares.clone(),
+        }
     }
 
     fn input_round_2(
         &self,
         true_inputs: Vec<F2>,
-        msgs: Vec<Self::MR1>,
-    ) -> Result<Vec<Self::MR2>, GcError> {
-        todo!()
+        msgs: Vec<CopzMsgRound1>,
+    ) -> Result<Vec<CopzMsgRound2>, GcError> {
+        debug_assert_eq!(self.party_id, self.num_parties - 1);
+
+        #[cfg(test)]
+        println!("True inputs: {true_inputs:?}");
+
+        // Reconstruct the \lambda_w shares
+        let mut output = true_inputs;
+        for CopzMsgRound1 { shares } in msgs.into_iter() {
+            debug_assert_eq!(output.len(), shares.len());
+            // TODO no MAC check here?
+            for (w, share) in shares.into_iter().enumerate() {
+                output[w] += share;
+            }
+        }
+
+        // We also need to add the shares from the evaluator
+        debug_assert_eq!(output.len(), self.input_shares.len());
+        for (o, i) in output.iter_mut().zip(&self.input_shares) {
+            *o += *i;
+        }
+
+        #[cfg(test)]
+        println!("Masked inputs: {output:?}");
+
+        Ok((0..self.num_parties)
+            .map(|_| CopzMsgRound2 {
+                masked_inputs: output.clone(),
+            })
+            .collect())
     }
 
-    fn input_round_3(&self, msg: Self::MR2) -> Self::MR3 {
-        todo!()
+    /// We receive the masked input x^1_w + \lambda_w,
+    /// then output the correct mask according to the masked input.
+    fn input_round_3(&self, msg: CopzMsgRound2) -> CopzMsgRound3 {
+        // Only the garbler can all this function
+        assert!(self.party_id != self.num_parties - 1);
+
+        let mut output = Vec::with_capacity(msg.masked_inputs.len());
+        assert_eq!(msg.masked_inputs.len(), self.input_labels.len());
+        for (label, masked_value) in self.input_labels.iter().zip(msg.masked_inputs) {
+            if masked_value == F2::ZERO {
+                output.push(*label);
+            } else {
+                output.push(*label + self.delta);
+            }
+        }
+        CopzMsgRound3 {
+            labels: output,
+            output_decoder: self.output_decoder.clone(),
+        }
     }
 }
 
@@ -516,9 +644,9 @@ mod tests {
             let lambda_uv_delta_i = lambda_uv_shares[1].to_x_delta_shares(&deltas[1]);
 
             let (w_hat, k_w_hat) = decrypt_garbled_gate(
-                &vec![garbled_table.clone()],
-                &vec![k_u_hat],
-                &vec![k_v_hat],
+                &[garbled_table.clone()],
+                &[k_u_hat],
+                &[k_v_hat],
                 &lambda_w_delta_i,
                 &lambda_u_delta_i,
                 &lambda_v_delta_i,

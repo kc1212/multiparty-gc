@@ -13,7 +13,7 @@ use crate::{
 use super::Evaluator;
 
 pub struct Wrk17Evaluator {
-    total_num_parties: u16,
+    num_parties: u16,
     /// Ordererd by topological order of AND gate
     /// r^1_{\gamma, \ell}, {M_j[r^1_{\gamma, \ell}]}, {K_1[r^j_{\gamma, \ell}]}
     garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
@@ -46,7 +46,7 @@ impl Evaluator for Wrk17Evaluator {
         } = garbling.get_evaluator_gates();
 
         Self {
-            total_num_parties,
+            num_parties: total_num_parties,
             garbling_shares,
             wire_mask_shares,
             delta,
@@ -187,8 +187,8 @@ impl Evaluator for Wrk17Evaluator {
         encoded: Wrk17EncodedOutput,
         decoder: Vec<Vec<(F2, F128b)>>,
     ) -> Result<Vec<F2>, GcError> {
-        if decoder.len() != self.total_num_parties as usize - 1 {
-            eprintln!("decoder.len != total_num_parties - 1");
+        if decoder.len() != self.num_parties as usize - 1 {
+            eprintln!("decoder.len != num_parties - 1");
             return Err(GcError::DecoderLengthError);
         }
         if encoded.masked_output_values.len() != decoder[0].len() {

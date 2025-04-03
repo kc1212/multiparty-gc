@@ -48,8 +48,8 @@ mod test {
 
     use crate::{
         MsgRound2, MsgRound3,
-        evaluator::{Evaluator, wrk17::Wrk17Evaluator},
-        garbler::{Garbler, wrk17::Wrk17Garbler},
+        evaluator::{Evaluator, copz::CopzEvaluator, wrk17::Wrk17Evaluator},
+        garbler::{Garbler, copz::CopzGarbler, wrk17::Wrk17Garbler},
         prep::InsecurePreprocessor,
     };
 
@@ -163,7 +163,7 @@ mod test {
         assert_eq!(eval_clear_circuit(&circuit, vec![1, 1]), vec![1]);
     }
 
-    fn run_and_check_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
+    fn run_wrk17_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
         // prepare preprocessor
         let (preps, runner) = InsecurePreprocessor::new(num_parties);
         let prep_handler = std::thread::spawn(move || {
@@ -183,6 +183,26 @@ mod test {
         prep_handler.join().unwrap();
     }
 
+    fn run_copz_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
+        // prepare preprocessor
+        let (preps, runner) = InsecurePreprocessor::new(num_parties);
+        let prep_handler = std::thread::spawn(move || {
+            let mut rng = AesRng::new();
+            runner.run_blocking(&mut rng).unwrap()
+        });
+
+        let garblers = preps
+            .into_iter()
+            .enumerate()
+            .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
+            .collect_vec();
+
+        run_and_check::<_, CopzEvaluator>(garblers, circuit, true_inputs);
+
+        // shutdown
+        prep_handler.join().unwrap();
+    }
+
     #[test]
     fn test_wrk17_aes() {
         let f = std::fs::File::open("circuits/aes_128.txt").unwrap();
@@ -192,7 +212,7 @@ mod test {
 
         let input_length: u64 = circuit.input_sizes().iter().sum();
         let true_inputs = vec![F2::ZERO; input_length as usize];
-        run_and_check_insecure_prep(&circuit, num_parties, true_inputs);
+        run_wrk17_insecure_prep(&circuit, num_parties, true_inputs);
     }
 
     #[test]
@@ -212,7 +232,29 @@ mod test {
             let circuit = bristol_fashion::read(buf_reader).unwrap();
             let num_parties = 5;
 
-            run_and_check_insecure_prep(&circuit, num_parties, true_inputs);
+            run_wrk17_insecure_prep(&circuit, num_parties, true_inputs);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_copz_basic() {
+        let circuits_inputs = vec![
+            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
+            // ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
+            // ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
+            // ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
+            // ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+            // ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
+        ];
+
+        for (circuit_file, true_inputs) in circuits_inputs {
+            let f = std::fs::File::open(circuit_file).unwrap();
+            let buf_reader = BufReader::new(f);
+            let circuit = bristol_fashion::read(buf_reader).unwrap();
+            let num_parties = 5;
+
+            run_copz_insecure_prep(&circuit, num_parties, true_inputs);
         }
     }
 }
