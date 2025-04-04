@@ -151,6 +151,12 @@ fn encrypt_garbled_table(
     num_parties: u16,
 ) -> CopzGarbledGate {
     let out_len = (128 + (num_parties as usize - 2) * 128) / 8;
+    #[cfg(test)]
+    {
+        println!(
+            "[enc] labels=({k_u_0:?}, {k_v_0:?}, {k_w_0:?}), gate={gate_id}, party_id={party_id}"
+        );
+    }
 
     let h = |k_left: &F128b, k_right: &F128b| {
         let mut hasher_left = blake3::Hasher::new();
@@ -326,6 +332,13 @@ pub(crate) fn decrypt_garbled_gate(
         let r_i_1 =
             u_hat * *lambda_v_delta + lambda_uv_delta + lambda_w_delta + v_hat * *lambda_u_delta;
         let k_w_hat = k_i + u_hat * *k_v_hat + r_i_sum + r_i_1;
+        #[cfg(test)]
+        {
+            println!(
+                "[dec] input_labels=({:?}, {:?}), output_label={:?}, u_hat={u_hat:?}, v_hat={v_hat:?}",
+                k_u_hat, k_v_hat, k_w_hat
+            );
+        }
         output_labels.push(k_w_hat);
     }
 
@@ -348,10 +361,10 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
     fn garble<R: Rng + CryptoRng>(&mut self, rng: &mut R, circuit: &Circuit) -> CopzGarbling {
         // Get the deltas, make sure lsb(\Delta_2) = 1
-        // This translates to delta of party_id = 1 since evaluator is party 0
-        let delta = self.preprocessor.init_delta().unwrap();
-        if self.party_id == 1 {
-            assert_eq!(delta.to_bytes()[0] & 1, 1);
+        // This translates to delta of party_id = 0 since evaluator is party n-1
+        self.delta = self.preprocessor.init_delta().unwrap();
+        if self.party_id == 0 {
+            assert_eq!(self.delta.to_bytes()[0] & 1, 1);
         }
         let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
         let mut wire_labels = self.gen_labels(rng, circuit);
@@ -390,7 +403,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                 }
                 Gate::INV { a, out } => {
                     if self.is_garbler() {
-                        wire_labels.insert(*out, wire_labels[a] + delta);
+                        wire_labels.insert(*out, wire_labels[a] + self.delta);
                     }
                     auth_bits.insert(*out, auth_bits[a].clone());
                 }
@@ -402,13 +415,13 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
                     /*
                     // <\lambda_u \Delta_j>, j \in [n]
-                    let u_delta_js = bit_a.to_x_delta_shares(&delta);
+                    let u_delta_js = bit_a.to_x_delta_shares(&self.delta);
                     // <\lambda_v \Delta_j>, j \in [n]
-                    let v_delta_js = bit_b.to_x_delta_shares(&delta);
+                    let v_delta_js = bit_b.to_x_delta_shares(&self.delta);
                     // <\lambda_w \Delta_j>, j \in [n]
-                    let w_delta_js = bit_out.to_x_delta_shares(&delta);
+                    let w_delta_js = bit_out.to_x_delta_shares(&self.delta);
                     // <\lambda_v \lambda_v \Delta_j>, j \in [n]
-                    let uv_delta_js = bit_prod.to_x_delta_shares(&delta);
+                    let uv_delta_js = bit_prod.to_x_delta_shares(&self.delta);
                     */
 
                     let r1 = lambda_v;
@@ -426,7 +439,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                             &k_u_0,
                             &k_v_0,
                             &k_w_0,
-                            &delta,
+                            &self.delta,
                             *out,
                             self.party_id,
                             self.num_parties,
@@ -488,7 +501,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                 wire_mask_shares: (nwires - output_wire_count..nwires)
                     .map(|i| auth_bits[&i].clone())
                     .collect(),
-                delta,
+                delta: self.delta,
             })
         }
     }

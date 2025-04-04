@@ -165,7 +165,7 @@ mod test {
 
     fn run_wrk17_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
         // prepare preprocessor
-        let (preps, runner) = InsecurePreprocessor::new(num_parties);
+        let (preps, runner) = InsecurePreprocessor::new(num_parties, false);
         let prep_handler = std::thread::spawn(move || {
             let mut rng = AesRng::new();
             runner.run_blocking(&mut rng).unwrap()
@@ -185,7 +185,7 @@ mod test {
 
     fn run_copz_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
         // prepare preprocessor
-        let (preps, runner) = InsecurePreprocessor::new(num_parties);
+        let (preps, runner) = InsecurePreprocessor::new(num_parties, true);
         let prep_handler = std::thread::spawn(move || {
             let mut rng = AesRng::new();
             runner.run_blocking(&mut rng).unwrap()
@@ -218,6 +218,7 @@ mod test {
     #[test]
     fn test_wrk17_basic() {
         let circuits_inputs = vec![
+            ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
             ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
             ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
             ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
@@ -237,22 +238,23 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_copz_basic() {
         let circuits_inputs = vec![
+            ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
             ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
-            // ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
-            // ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
-            // ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
-            // ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
-            // ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ZERO, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
         ];
 
         for (circuit_file, true_inputs) in circuits_inputs {
             let f = std::fs::File::open(circuit_file).unwrap();
             let buf_reader = BufReader::new(f);
             let circuit = bristol_fashion::read(buf_reader).unwrap();
-            let num_parties = 5;
+            let num_parties = 2;
 
             run_copz_insecure_prep(&circuit, num_parties, true_inputs);
         }

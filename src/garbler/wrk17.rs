@@ -387,7 +387,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
     where
         R: Rng + CryptoRng,
     {
-        let delta = self.preprocessor.init_delta().unwrap();
+        self.delta = self.preprocessor.init_delta().unwrap();
         let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
 
         let mut wire_labels = self.gen_labels(rng, circuit);
@@ -417,7 +417,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 }
                 Gate::INV { a, out } => {
                     if self.is_garbler() {
-                        wire_labels.insert(*out, wire_labels[a] + delta);
+                        wire_labels.insert(*out, wire_labels[a] + self.delta);
                     }
                     auth_bits.insert(*out, auth_bits[a].clone());
                 }
@@ -436,7 +436,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                     // a = 1, b = 1: 1 + \lambda_a + \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
                     let share3 = if self.is_garbler() {
                         let mut tmp = &share1 + bit_b;
-                        *tmp.mac_keys.get_mut(&(&self.num_parties - 1)).unwrap() += delta;
+                        *tmp.mac_keys.get_mut(&(&self.num_parties - 1)).unwrap() += self.delta;
                         tmp
                     } else {
                         let mut tmp = &share1 + bit_b;
@@ -452,7 +452,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                             rows: [
                                 Wrk17GarbledRow::encrypt_row(
                                     &share0,
-                                    delta,
+                                    self.delta,
                                     label_a_0,
                                     label_b_0,
                                     label_gamma_0,
@@ -461,7 +461,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                                 ),
                                 Wrk17GarbledRow::encrypt_row(
                                     &share1,
-                                    delta,
+                                    self.delta,
                                     label_a_0,
                                     label_b_0,
                                     label_gamma_0,
@@ -470,7 +470,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                                 ),
                                 Wrk17GarbledRow::encrypt_row(
                                     &share2,
-                                    delta,
+                                    self.delta,
                                     label_a_0,
                                     label_b_0,
                                     label_gamma_0,
@@ -479,7 +479,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                                 ),
                                 Wrk17GarbledRow::encrypt_row(
                                     &share3,
-                                    delta,
+                                    self.delta,
                                     label_a_0,
                                     label_b_0,
                                     label_gamma_0,
@@ -503,7 +503,6 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
         // Keep some information that we need for inputs
         let input_wire_count: u64 = circuit.input_sizes().iter().sum();
-        self.delta = delta;
         for input_idx in 0..input_wire_count {
             // Shared by garblers and evaluator
             let r = auth_bits[&input_idx].share;
@@ -560,7 +559,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 wire_mask_shares: (nwires - output_wire_count..nwires)
                     .map(|i| auth_bits[&i].clone())
                     .collect(),
-                delta,
+                delta: self.delta,
             })
         }
     }

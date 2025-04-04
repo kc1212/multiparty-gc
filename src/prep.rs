@@ -5,6 +5,7 @@ use std::sync::mpsc::Sender;
 use rand::CryptoRng;
 use rand::Rng;
 use scuttlebutt::ring::FiniteRing;
+use scuttlebutt::serialization::CanonicalSerialize;
 use swanky_field_binary::F2;
 use swanky_field_binary::F128b;
 
@@ -140,6 +141,7 @@ impl InsecurePreprocessorResp {
 }
 
 pub struct InsecurePreprocessorRunner {
+    tweak_delta_lsb: bool,
     recv_chan: Receiver<InsecurePreprocessorReq>,
     send_chans: Vec<Sender<InsecurePreprocessorResp>>,
 }
@@ -157,7 +159,17 @@ impl InsecurePreprocessorRunner {
         R: Rng + CryptoRng,
     {
         let party_count = self.send_chans.len();
-        let deltas: Vec<_> = (0..party_count).map(|_| F128b::random(rng)).collect();
+        let deltas: Vec<_> = {
+            let mut tmp: Vec<F128b> = (0..party_count).map(|_| F128b::random(rng)).collect();
+            if self.tweak_delta_lsb {
+                let mut tmp0_buf = tmp[0].to_bytes();
+                tmp0_buf[0] |= 1;
+                tmp[0] = F128b::from_bytes(&tmp0_buf).unwrap();
+                tmp
+            } else {
+                tmp
+            }
+        };
 
         #[cfg(test)]
         println!("Starting InsecurePreprocessorRunner for {party_count} parties");
@@ -307,7 +319,7 @@ impl StaticPreprocessor for InsecurePreprocessor {
 }
 
 impl InsecurePreprocessor {
-    pub fn new(party_count: u16) -> (Vec<Self>, InsecurePreprocessorRunner) {
+    pub fn new(party_count: u16, tweak_delta_lsb: bool) -> (Vec<Self>, InsecurePreprocessorRunner) {
         let (req_send_chan, req_recv_chan) = mpsc::channel();
         let (resp_send_chans, preps) = (0..party_count)
             .map(|party_id| {
@@ -325,6 +337,7 @@ impl InsecurePreprocessor {
             .unzip();
 
         let runner = InsecurePreprocessorRunner {
+            tweak_delta_lsb,
             recv_chan: req_recv_chan,
             send_chans: resp_send_chans,
         };
