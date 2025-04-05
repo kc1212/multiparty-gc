@@ -238,6 +238,18 @@ mod test {
     }
 
     #[test]
+    fn test_copz_aes() {
+        let f = std::fs::File::open("circuits/aes_128.txt").unwrap();
+        let buf_reader = BufReader::new(f);
+        let circuit = bristol_fashion::read(buf_reader).unwrap();
+        let num_parties = 3;
+
+        let input_length: u64 = circuit.input_sizes().iter().sum();
+        let true_inputs = vec![F2::ZERO; input_length as usize];
+        run_copz_insecure_prep(&circuit, num_parties, true_inputs);
+    }
+
+    #[test]
     fn test_copz_basic() {
         let circuits_inputs = vec![
             ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
