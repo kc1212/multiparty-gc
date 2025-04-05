@@ -122,6 +122,7 @@ impl Evaluator for CopzEvaluator {
                     let lambda_u_delta_i = lambda_u.to_x_delta_shares(&self.delta);
                     let lambda_v_delta_i = lambda_v.to_x_delta_shares(&self.delta);
                     let lambda_uv_delta_i = lambda_uv.to_x_delta_shares(&self.delta);
+
                     let (new_share, new_labels) = decrypt_garbled_gate(
                         &garblings[and_gate_ctr],
                         &labels[*a as usize],

@@ -207,7 +207,7 @@ impl InsecurePreprocessorRunner {
                     let n = *elements_all_equal(&reqs).ok_or(GcError::NotAllEqual)?;
 
                     let mut output = vec![vec![]; party_count];
-                    for _ in 0..n {
+                    for _i in 0..n {
                         let secret = F2::random(rng);
                         let shares = secret_share_with_delta(secret, &deltas, rng);
                         for (party_id, share) in shares.into_iter().enumerate() {

@@ -195,9 +195,9 @@ fn encrypt_garbled_table(
         let mut body = Cursor::new(Vec::<u8>::with_capacity(out_len));
         body.write_all(&(r.to_x_delta_i_share(party_id, delta) + k).to_bytes())
             .unwrap();
-        for j in 0..num_parties {
-            if j != party_id && j != num_parties - 1 {
-                let buf = r.to_x_delta_i_share(j, delta).to_bytes();
+        for j in 0..num_parties - 1 {
+            if j != party_id {
+                let buf = r.to_x_delta_i_share(j, &F128b::ZERO).to_bytes();
                 body.write_all(&buf).unwrap();
             }
         }
@@ -270,6 +270,11 @@ pub(crate) fn decrypt_garbled_gate(
             .collect_vec()
     };
 
+    // this is to compute
+    // sum_{j != i} r^i_j
+    let mut r_i_j_sum = vec![F128b::ZERO; num_parties as usize];
+    let mut k_is = Vec::with_capacity(num_parties as usize);
+
     // iterate over i
     let mut output_labels = vec![];
     for (
@@ -317,26 +322,33 @@ pub(crate) fn decrypt_garbled_gate(
         // read k^i
         body_cursor.read_exact(&mut buf).unwrap();
         let k_i = F128b::from_bytes(&buf).unwrap();
+        k_is.push(k_i);
 
-        // read {r^j_i}_{j != i, 1} and then sum everything
-        let r_i_sum = (0..num_parties - 2)
-            .map(|_| {
+        #[allow(clippy::needless_range_loop)]
+        for j in 0..num_parties as usize - 1 {
+            if j != party_id {
                 body_cursor.read_exact(&mut buf).unwrap();
-                F128b::from_bytes(&buf).unwrap()
-            })
-            .fold(F128b::ZERO, |acc, x| acc + x);
+                r_i_j_sum[j] += F128b::from_bytes(&buf).unwrap();
+            }
+        }
 
         // the reader should be empty
         debug_assert_eq!(0, body_cursor.fill_buf().unwrap().len());
 
+        // extract r^i_1
         let r_i_1 =
             u_hat * *lambda_v_delta + lambda_uv_delta + lambda_w_delta + v_hat * *lambda_u_delta;
-        let k_w_hat = k_i + u_hat * *k_v_hat + r_i_sum + r_i_1;
+        r_i_j_sum[party_id] += r_i_1;
+    }
+
+    // iterate over i = party_id and
+    for (k_v_hat, k_i, r_sum) in izip!(k_v_hats, k_is, r_i_j_sum) {
+        let k_w_hat = k_i + u_hat * *k_v_hat + r_sum;
         #[cfg(test)]
         {
             println!(
-                "[dec] input_labels=({:?}, {:?}), output_label={:?}, u_hat={u_hat:?}, v_hat={v_hat:?}",
-                k_u_hat, k_v_hat, k_w_hat
+                "[dec] output_label={:?}, u_hat={u_hat:?}, v_hat={v_hat:?}",
+                k_w_hat
             );
         }
         output_labels.push(k_w_hat);
@@ -410,22 +422,11 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                 Gate::AND { a, b, out } => {
                     let lambda_u = &auth_bits[a];
                     let lambda_v = &auth_bits[b];
-                    let lambda_uv = &auth_bits[out];
-                    let lambda_w = self.preprocessor.auth_mul(lambda_u, lambda_v).unwrap();
-
-                    /*
-                    // <\lambda_u \Delta_j>, j \in [n]
-                    let u_delta_js = bit_a.to_x_delta_shares(&self.delta);
-                    // <\lambda_v \Delta_j>, j \in [n]
-                    let v_delta_js = bit_b.to_x_delta_shares(&self.delta);
-                    // <\lambda_w \Delta_j>, j \in [n]
-                    let w_delta_js = bit_out.to_x_delta_shares(&self.delta);
-                    // <\lambda_v \lambda_v \Delta_j>, j \in [n]
-                    let uv_delta_js = bit_prod.to_x_delta_shares(&self.delta);
-                    */
+                    let lambda_uv = self.preprocessor.auth_mul(lambda_u, lambda_v).unwrap();
+                    let lambda_w = &auth_bits[out];
 
                     let r1 = lambda_v;
-                    let r2_0 = lambda_uv + &lambda_w;
+                    let r2_0 = &lambda_uv + lambda_w;
                     let r2_1 = &r2_0 + lambda_u;
 
                     if self.is_garbler() {

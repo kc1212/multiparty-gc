@@ -92,16 +92,22 @@ where
         Ok(())
     }
 
-    pub fn to_x_delta_i_share(&self, i: u16, delta: &MacFF) -> MacFF
+    /// Compute the additive share of <x \Delta_j> from the authenticate share.
+    ///
+    /// Note: calling this function only makes sense when:
+    /// 1. using j that is not the caller's party ID or
+    /// 2. using j that is the party's ID (j == i) and using the party's delta_i.
+    pub fn to_x_delta_i_share(&self, j: u16, delta_i: &MacFF) -> MacFF
     where
         ShareFF: IsSubFieldOf<MacFF>,
     {
-        if self.party_id == i {
+        let i = self.party_id;
+        if i == j {
             // <x \Delta_i>_i = x^i \Delta_i + \sum_{j \ne i} K_j[x^i]
-            self.share * *delta + self.sum_mac_keys()
+            self.share * *delta_i + self.sum_mac_keys()
         } else {
             // <x \Delta_i>_j = M_j[x^i]
-            self.mac_values[&i]
+            self.mac_values[&j]
         }
     }
 

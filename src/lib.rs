@@ -254,7 +254,7 @@ mod test {
             let f = std::fs::File::open(circuit_file).unwrap();
             let buf_reader = BufReader::new(f);
             let circuit = bristol_fashion::read(buf_reader).unwrap();
-            let num_parties = 2;
+            let num_parties = 5;
 
             run_copz_insecure_prep(&circuit, num_parties, true_inputs);
         }
