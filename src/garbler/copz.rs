@@ -8,11 +8,26 @@ use scuttlebutt::{ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    MsgRound1, MsgRound2, MsgRound3, error::GcError, garbler::auth_bits_from_prep,
-    prep::Preprocessor, sharing::AuthShare,
+    InputMsg1, InputMsg2, InputMsg3, OutputMsg1, OutputMsg2, error::GcError,
+    garbler::auth_bits_from_prep, prep::Preprocessor, sharing::AuthShare,
 };
 
 use super::{Garbler, Garbling};
+
+/// P_1 broadcasts X, {\hat{w}} to all garblers
+/// Additionally it sends h_i = H({k^i_{w,\hat{w}}}) to P_i
+pub struct CopzOutputMsg1 {
+    pub(crate) w_hats: Vec<F2>,
+    pub(crate) h: [u8; 32],
+    pub(crate) chi: [u8; 32],
+}
+
+impl OutputMsg1 for CopzOutputMsg1 {}
+
+/// P_i sends z^i = H_X({<t_g \Delta^1>}_g) to P_1.
+pub struct CopzOutputMsg2;
+
+impl OutputMsg2 for CopzOutputMsg2 {}
 
 pub struct CopzGarbler<P: Preprocessor> {
     party_id: u16,
@@ -82,29 +97,29 @@ impl CopzGarbling {
     }
 }
 
-pub struct CopzMsgRound1 {
+pub struct CopzInputMsg1 {
     shares: Vec<F2>,
 }
 
-impl MsgRound1 for CopzMsgRound1 {}
+impl InputMsg1 for CopzInputMsg1 {}
 
 #[derive(Clone)]
-pub struct CopzMsgRound2 {
+pub struct CopzInputMsg2 {
     masked_inputs: Vec<F2>,
 }
 
-impl MsgRound2 for CopzMsgRound2 {
+impl InputMsg2 for CopzInputMsg2 {
     fn into_masked_inputs(self) -> Vec<F2> {
         self.masked_inputs
     }
 }
 
-pub struct CopzMsgRound3 {
+pub struct CopzInputMsg3 {
     labels: Vec<F128b>,
     output_decoder: Vec<F2>,
 }
 
-impl MsgRound3 for CopzMsgRound3 {
+impl InputMsg3 for CopzInputMsg3 {
     type Decoder = Vec<F2>;
 
     fn into_labels_and_decoder(self) -> (Vec<F128b>, Self::Decoder) {
@@ -363,9 +378,11 @@ pub(crate) fn decrypt_garbled_gate(
 
 impl<P: Preprocessor> Garbler for CopzGarbler<P> {
     type Gc = CopzGarbling;
-    type MR1 = CopzMsgRound1;
-    type MR2 = CopzMsgRound2;
-    type MR3 = CopzMsgRound3;
+    type IM1 = CopzInputMsg1;
+    type IM2 = CopzInputMsg2;
+    type IM3 = CopzInputMsg3;
+    type OM1 = CopzOutputMsg1;
+    type OM2 = CopzOutputMsg2;
 
     fn num_parties(&self) -> u16 {
         self.num_parties
@@ -511,11 +528,11 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         self.party_id
     }
 
-    fn input_round_1(&self) -> CopzMsgRound1 {
+    fn input_round_1(&self) -> CopzInputMsg1 {
         // Only the garbler can all this function
         assert!(self.party_id != self.num_parties - 1);
 
-        CopzMsgRound1 {
+        CopzInputMsg1 {
             shares: self.input_shares.clone(),
         }
     }
@@ -523,8 +540,8 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
     fn input_round_2(
         &self,
         true_inputs: Vec<F2>,
-        msgs: Vec<CopzMsgRound1>,
-    ) -> Result<Vec<CopzMsgRound2>, GcError> {
+        msgs: Vec<CopzInputMsg1>,
+    ) -> Result<Vec<CopzInputMsg2>, GcError> {
         debug_assert_eq!(self.party_id, self.num_parties - 1);
 
         #[cfg(test)]
@@ -532,7 +549,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
         // Reconstruct the \lambda_w shares
         let mut output = true_inputs;
-        for CopzMsgRound1 { shares } in msgs.into_iter() {
+        for CopzInputMsg1 { shares } in msgs.into_iter() {
             debug_assert_eq!(output.len(), shares.len());
             // TODO no MAC check here?
             for (w, share) in shares.into_iter().enumerate() {
@@ -550,7 +567,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         println!("Masked inputs: {output:?}");
 
         Ok((0..self.num_parties)
-            .map(|_| CopzMsgRound2 {
+            .map(|_| CopzInputMsg2 {
                 masked_inputs: output.clone(),
             })
             .collect())
@@ -558,7 +575,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
     /// We receive the masked input x^1_w + \lambda_w,
     /// then output the correct mask according to the masked input.
-    fn input_round_3(&self, msg: CopzMsgRound2) -> CopzMsgRound3 {
+    fn input_round_3(&self, msg: CopzInputMsg2) -> CopzInputMsg3 {
         // Only the garbler can all this function
         assert!(self.party_id != self.num_parties - 1);
 
@@ -571,10 +588,15 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                 output.push(*label + self.delta);
             }
         }
-        CopzMsgRound3 {
+        CopzInputMsg3 {
             labels: output,
             output_decoder: self.output_decoder.clone(),
         }
+    }
+
+    fn check_output_msg1(&self, _msg1: CopzOutputMsg1) -> Result<CopzOutputMsg2, GcError> {
+        // TODO
+        Ok(CopzOutputMsg2)
     }
 }
 

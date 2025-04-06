@@ -13,7 +13,7 @@ use scuttlebutt::serialization::CanonicalSerialize;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    MsgRound1, MsgRound2, MsgRound3, error::GcError, garbler::auth_bits_from_prep,
+    DummyOutput, InputMsg1, InputMsg2, InputMsg3, error::GcError, garbler::auth_bits_from_prep,
     prep::Preprocessor, sharing::AuthShare,
 };
 
@@ -338,30 +338,30 @@ impl Wrk17Garbling {
     }
 }
 
-pub struct Wrk17MsgRound1 {
+pub struct Wrk17InputMsg1 {
     shares: Vec<F2>,
     macs: Vec<F128b>,
 }
 
-impl MsgRound1 for Wrk17MsgRound1 {}
+impl InputMsg1 for Wrk17InputMsg1 {}
 
 #[derive(Clone)]
-pub struct Wrk17MsgRound2 {
+pub struct Wrk17InputMsg2 {
     masked_inputs: Vec<F2>,
 }
 
-impl MsgRound2 for Wrk17MsgRound2 {
+impl InputMsg2 for Wrk17InputMsg2 {
     fn into_masked_inputs(self) -> Vec<F2> {
         self.masked_inputs
     }
 }
 
-pub struct Wrk17MsgRound3 {
+pub struct Wrk17InputMsg3 {
     labels: Vec<F128b>,
     output_decoder: Vec<(F2, F128b)>,
 }
 
-impl MsgRound3 for Wrk17MsgRound3 {
+impl InputMsg3 for Wrk17InputMsg3 {
     type Decoder = Vec<(F2, F128b)>;
 
     fn into_labels_and_decoder(self) -> (Vec<F128b>, Vec<(F2, F128b)>) {
@@ -371,9 +371,11 @@ impl MsgRound3 for Wrk17MsgRound3 {
 
 impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
     type Gc = Wrk17Garbling;
-    type MR1 = Wrk17MsgRound1;
-    type MR2 = Wrk17MsgRound2;
-    type MR3 = Wrk17MsgRound3;
+    type IM1 = Wrk17InputMsg1;
+    type IM2 = Wrk17InputMsg2;
+    type IM3 = Wrk17InputMsg3;
+    type OM1 = DummyOutput;
+    type OM2 = DummyOutput;
 
     fn party_id(&self) -> u16 {
         self.party_id
@@ -388,6 +390,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         R: Rng + CryptoRng,
     {
         self.delta = self.preprocessor.init_delta().unwrap();
+        // these are the authenticated shares of the wire masks
         let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
 
         let mut wire_labels = self.gen_labels(rng, circuit);
@@ -564,11 +567,11 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         }
     }
 
-    fn input_round_1(&self) -> Wrk17MsgRound1 {
+    fn input_round_1(&self) -> Wrk17InputMsg1 {
         // Only the garbler can all this function
         assert!(self.party_id != self.num_parties - 1);
 
-        Wrk17MsgRound1 {
+        Wrk17InputMsg1 {
             shares: self.input_shares.clone(),
             macs: self.input_macs.clone(),
         }
@@ -577,8 +580,8 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
     fn input_round_2(
         &self,
         true_inputs: Vec<F2>,
-        msgs: Vec<Wrk17MsgRound1>,
-    ) -> Result<Vec<Wrk17MsgRound2>, GcError> {
+        msgs: Vec<Wrk17InputMsg1>,
+    ) -> Result<Vec<Wrk17InputMsg2>, GcError> {
         debug_assert_eq!(self.party_id, self.num_parties - 1);
 
         #[cfg(test)]
@@ -588,7 +591,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         // so we find the corresponding MAC key and do a MAC check.
         // Also reconstruct at the same time.
         let mut output = true_inputs;
-        for (party_id, Wrk17MsgRound1 { macs, shares }) in msgs.into_iter().enumerate() {
+        for (party_id, Wrk17InputMsg1 { macs, shares }) in msgs.into_iter().enumerate() {
             debug_assert_eq!(macs.len(), shares.len());
             debug_assert_eq!(macs.len(), output.len());
             // get the mac keys that I have
@@ -611,7 +614,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         println!("Masked inputs: {output:?}");
 
         Ok((0..self.num_parties)
-            .map(|_| Wrk17MsgRound2 {
+            .map(|_| Wrk17InputMsg2 {
                 masked_inputs: output.clone(),
             })
             .collect())
@@ -619,7 +622,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
     /// We receive the masked input x^1_w + \lambda_w,
     /// then output the correct mask according to the masked input.
-    fn input_round_3(&self, msg: Wrk17MsgRound2) -> Wrk17MsgRound3 {
+    fn input_round_3(&self, msg: Wrk17InputMsg2) -> Wrk17InputMsg3 {
         // Only the garbler can all this function
         assert!(self.party_id != self.num_parties - 1);
 
@@ -632,10 +635,14 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 output.push(*label + self.delta);
             }
         }
-        Wrk17MsgRound3 {
+        Wrk17InputMsg3 {
             labels: output,
             output_decoder: self.output_decoder.clone(),
         }
+    }
+
+    fn check_output_msg1(&self, _msg1: Self::OM1) -> Result<Self::OM2, GcError> {
+        Ok(DummyOutput)
     }
 }
 

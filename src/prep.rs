@@ -2,6 +2,7 @@ use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 
+use itertools::Itertools;
 use rand::CryptoRng;
 use rand::Rng;
 use scuttlebutt::ring::FiniteRing;
@@ -13,6 +14,7 @@ use crate::error::GcError;
 use crate::sharing::AuthShare;
 use crate::sharing::secret_share_with_delta;
 use crate::sharing::verify_and_reconstruct;
+use crate::transpose;
 
 /// Static preprocessor is one that has no networking.
 ///
@@ -36,8 +38,13 @@ pub trait StaticPreprocessor {
         y: &AuthShare<F2, F128b>,
     ) -> Result<Vec<F128b>, GcError>;
 
-    fn open_value(&mut self, x: &AuthShare<F2, F128b>);
-    fn open_values(&mut self, x: &[AuthShare<F2, F128b>]);
+    /// Open values `xs` to a party with ID `party_id`.
+    /// Returns None if the caller does not have ID `party_id`, otherwise return the opened values.
+    fn open_values_to(
+        &mut self,
+        party_id: u16,
+        xs: &[AuthShare<F2, F128b>],
+    ) -> Result<Option<Vec<F2>>, GcError>;
 
     fn done(&mut self);
 }
@@ -53,6 +60,7 @@ enum InsecurePreprocessorReq {
     Bits(u16, u64),
     Triple(u16, (AuthShare<F2, F128b>, AuthShare<F2, F128b>)),
     // Triples(Vec<(AuthShare<F2, F128b>, AuthShare<F2, F128b>)>),
+    OpenValuesTo(u16, Vec<AuthShare<F2, F128b>>),
     Done(u16),
 }
 
@@ -62,6 +70,7 @@ impl InsecurePreprocessorReq {
             InsecurePreprocessorReq::Delta(pid) => pid,
             InsecurePreprocessorReq::Bits(pid, _) => pid,
             InsecurePreprocessorReq::Triple(pid, (_, _)) => pid,
+            InsecurePreprocessorReq::OpenValuesTo(pid, _) => pid,
             InsecurePreprocessorReq::Done(pid) => pid,
         }
     }
@@ -88,6 +97,13 @@ impl InsecurePreprocessorReq {
         }
     }
 
+    fn take_open_values_to(self) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
+        match self {
+            InsecurePreprocessorReq::OpenValuesTo(_, values) => Ok(values),
+            _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
+        }
+    }
+
     // fn take_triples(self) -> Result<Vec<(AuthShare<F2, F128b>, AuthShare<F2, F128b>)>, GcError> {
     //     match self {
     //         InsecurePreprocessorReq::Triples(t) => Ok(t),
@@ -107,6 +123,7 @@ enum InsecurePreprocessorResp {
     Delta(F128b),
     Bits(Vec<AuthShare<F2, F128b>>),
     Triple(AuthShare<F2, F128b>),
+    OpenValuesTo(Vec<F2>),
     // Triples(Vec<AuthShare<F2, F128b>>),
 }
 
@@ -128,6 +145,13 @@ impl InsecurePreprocessorResp {
     fn expect_triple(self) -> Result<AuthShare<F2, F128b>, GcError> {
         match self {
             InsecurePreprocessorResp::Triple(x) => Ok(x),
+            _ => Err(GcError::UnexpectedMessageType("in resopnse".to_string())),
+        }
+    }
+
+    fn expect_open_values_to(self) -> Result<Vec<F2>, GcError> {
+        match self {
+            InsecurePreprocessorResp::OpenValuesTo(x) => Ok(x),
             _ => Err(GcError::UnexpectedMessageType("in resopnse".to_string())),
         }
     }
@@ -237,6 +261,24 @@ impl InsecurePreprocessorRunner {
                         ch.send(InsecurePreprocessorResp::Triple(share))?;
                     }
                 }
+                InsecurePreprocessorReq::OpenValuesTo(..) => {
+                    let receivers = batch.iter().map(|x| x.get_party_id()).collect_vec();
+                    let receiver = *elements_all_equal(&receivers).ok_or(GcError::NotAllEqual)?;
+
+                    let reqs = batch
+                        .into_iter()
+                        .map(|x| x.take_open_values_to())
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    let reqs = transpose(reqs);
+
+                    let res = reqs
+                        .into_iter()
+                        .map(|req| verify_and_reconstruct(party_count as u16, req, &deltas))
+                        .collect::<Result<Vec<_>, GcError>>()?;
+                    self.send_chans[receiver as usize]
+                        .send(InsecurePreprocessorResp::OpenValuesTo(res))?;
+                }
                 // InsecurePreprocessorReq::Triples(..) => {
                 //     unimplemented!()
                 // }
@@ -303,12 +345,19 @@ impl StaticPreprocessor for InsecurePreprocessor {
         unimplemented!()
     }
 
-    fn open_value(&mut self, _x: &AuthShare<F2, F128b>) {
-        unimplemented!()
-    }
-
-    fn open_values(&mut self, _x: &[AuthShare<F2, F128b>]) {
-        unimplemented!()
+    fn open_values_to(
+        &mut self,
+        party_id: u16,
+        xs: &[AuthShare<F2, F128b>],
+    ) -> Result<Option<Vec<F2>>, GcError> {
+        self.send_chan
+            .send(InsecurePreprocessorReq::OpenValuesTo(party_id, xs.to_vec()))?;
+        if self.party_id == party_id {
+            let res = self.recv_chan.recv()?;
+            Ok(Some(res.expect_open_values_to()?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn done(&mut self) {

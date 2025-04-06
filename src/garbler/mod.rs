@@ -6,7 +6,8 @@ use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    MsgRound1, MsgRound2, MsgRound3, error::GcError, prep::Preprocessor, sharing::AuthShare,
+    InputMsg1, InputMsg2, InputMsg3, OutputMsg1, OutputMsg2, error::GcError, prep::Preprocessor,
+    sharing::AuthShare,
 };
 
 pub mod copz;
@@ -14,25 +15,35 @@ pub mod wrk17;
 
 pub trait Garbler {
     type Gc: Garbling;
-    type MR1: MsgRound1;
-    type MR2: MsgRound2 + Clone;
-    type MR3: MsgRound3;
+    type IM1: InputMsg1;
+    type IM2: InputMsg2 + Clone;
+    type IM3: InputMsg3;
+    type OM1: OutputMsg1;
+    type OM2: OutputMsg2;
 
     fn garble<R: Rng + CryptoRng>(&mut self, rng: &mut R, circuit: &Circuit) -> Self::Gc;
     fn party_id(&self) -> u16;
     fn num_parties(&self) -> u16;
 
-    fn input_round_1(&self) -> Self::MR1;
+    /// Called by the garblers, messages are sent to the single evaluator.
+    fn input_round_1(&self) -> Self::IM1;
+
+    /// Called by the evaluator, messages are sent to the garblers.
     fn input_round_2(
         &self,
         true_inputs: Vec<F2>,
-        msgs: Vec<Self::MR1>,
-    ) -> Result<Vec<Self::MR2>, GcError>;
-    fn input_round_3(&self, msg: Self::MR2) -> Self::MR3;
+        msgs: Vec<Self::IM1>,
+    ) -> Result<Vec<Self::IM2>, GcError>;
+
+    /// Called by the garblers, messages are sent to the evaluator.
+    fn input_round_3(&self, msg: Self::IM2) -> Self::IM3;
 
     fn is_garbler(&self) -> bool {
         self.party_id() != self.num_parties() - 1
     }
+
+    /// - `msg1`: from the evaluator, that the garbler needs to verify
+    fn check_output_msg1(&self, msg1: Self::OM1) -> Result<Self::OM2, GcError>;
 
     fn gen_labels<R>(&mut self, rng: &mut R, circuit: &Circuit) -> BTreeMap<u64, F128b>
     where

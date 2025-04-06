@@ -1,11 +1,16 @@
 use bristol_fashion::{Circuit, Gate};
 use itertools::{Itertools, izip};
+use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
+use scuttlebutt::serialization::CanonicalSerialize;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
+    ExtractOutputMsg1,
     error::GcError,
-    garbler::copz::{CopzEvaluatorOutput, CopzGarbling, decrypt_garbled_gate},
+    garbler::copz::{
+        CopzEvaluatorOutput, CopzGarbling, CopzOutputMsg1, CopzOutputMsg2, decrypt_garbled_gate,
+    },
     sharing::AuthShare,
     transpose,
 };
@@ -26,12 +31,32 @@ pub struct CopzEvaluator {
 
 pub struct CopzEncodedOutput {
     masked_output_values: Vec<F2>,
+    digests: Vec<[u8; 32]>,
+}
+
+impl ExtractOutputMsg1 for CopzEncodedOutput {
+    type OM1 = CopzOutputMsg1;
+
+    fn extract_outupt_msg1<R: Rng + CryptoRng>(&self, rng: &mut R) -> Vec<CopzOutputMsg1> {
+        let mut chi = [0u8; 32];
+        rng.fill_bytes(&mut chi);
+        self.digests
+            .iter()
+            .map(|h| CopzOutputMsg1 {
+                w_hats: self.masked_output_values.clone(),
+                h: *h,
+                chi,
+            })
+            .collect()
+    }
 }
 
 impl Evaluator for CopzEvaluator {
     type Gc = CopzGarbling;
     type Label = F128b;
     type GarbledOutput = CopzEncodedOutput;
+    type OM1 = CopzOutputMsg1;
+    type OM2 = CopzOutputMsg2;
 
     // To decode, each party needs to send the output wire masks.
     type Decoder = Vec<F2>;
@@ -57,7 +82,7 @@ impl Evaluator for CopzEvaluator {
         garblings: Vec<CopzGarbling>,
         masked_inputs: Vec<F2>,
         input_labels: Vec<Vec<F128b>>,
-    ) -> Result<Self::GarbledOutput, crate::error::GcError> {
+    ) -> Result<Self::GarbledOutput, GcError> {
         // party with index n - 1 is the evaluator
         let party_count = garblings.len() + 1;
         let input_len: u64 = circuit.input_sizes().iter().sum();
@@ -92,6 +117,13 @@ impl Evaluator for CopzEvaluator {
                 .collect_vec(),
         );
 
+        // Evaluate the gates, at the same time compute h^i = H({k^i_{w, \hat{w}}})
+        let mut hashers = (0..self.num_parties - 1)
+            .map(|_| {
+                // TODO add domain separator
+                blake3::Hasher::new()
+            })
+            .collect_vec();
         let mut and_gate_ctr = 0usize;
         for gate in circuit.gates() {
             match gate {
@@ -149,6 +181,9 @@ impl Evaluator for CopzEvaluator {
                     debug_assert_eq!(labels[*out as usize].len(), new_labels.len());
                     debug_assert!(labels[*out as usize].iter().all(|x| *x == F128b::ZERO));
 
+                    for (l, hasher) in new_labels.iter().zip(&mut hashers) {
+                        hasher.update(&l.to_bytes());
+                    }
                     labels[*out as usize] = new_labels;
                     and_gate_ctr += 1;
                 }
@@ -169,11 +204,19 @@ impl Evaluator for CopzEvaluator {
 
         Ok(CopzEncodedOutput {
             masked_output_values,
+            digests: hashers
+                .into_iter()
+                .map(|hasher| {
+                    let h = hasher.finalize();
+                    *h.as_bytes()
+                })
+                .collect_vec(),
         })
     }
 
-    fn decode(
+    fn check_and_decode(
         &self,
+        _output_msg2: Vec<Self::OM2>,
         encoded: CopzEncodedOutput,
         decoder: Vec<Vec<F2>>,
     ) -> Result<Vec<F2>, GcError> {

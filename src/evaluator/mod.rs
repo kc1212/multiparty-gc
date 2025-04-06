@@ -2,15 +2,17 @@ use bristol_fashion::Circuit;
 use scuttlebutt::field::FiniteField;
 use swanky_field_binary::F2;
 
-use crate::{error::GcError, garbler::Garbling};
+use crate::{ExtractOutputMsg1, OutputMsg1, OutputMsg2, error::GcError, garbler::Garbling};
 
 pub mod copz;
 pub mod wrk17;
 
 pub trait Evaluator {
     type Gc: Garbling;
+    type OM1: OutputMsg1;
+    type OM2: OutputMsg2;
     type Label: FiniteField;
-    type GarbledOutput;
+    type GarbledOutput: ExtractOutputMsg1;
     type Decoder;
 
     fn from_garbling(garbling: Self::Gc) -> Self;
@@ -23,8 +25,9 @@ pub trait Evaluator {
         input_labels: Vec<Vec<Self::Label>>,
     ) -> Result<Self::GarbledOutput, GcError>;
 
-    fn decode(
+    fn check_and_decode(
         &self,
+        output_msg2: Vec<Self::OM2>,
         encoded: Self::GarbledOutput,
         decoder: Vec<Self::Decoder>,
     ) -> Result<Vec<F2>, GcError>;

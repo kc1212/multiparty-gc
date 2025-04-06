@@ -1,3 +1,4 @@
+use rand::{CryptoRng, Rng};
 use swanky_field_binary::{F2, F128b};
 
 pub mod error;
@@ -10,17 +11,33 @@ pub trait GcPrf {
     fn run(&self, key: F128b, player: usize, gate: usize) -> F128b;
 }
 
-pub trait MsgRound1 {}
+pub trait InputMsg1 {}
 
-pub trait MsgRound2 {
+pub trait InputMsg2 {
     fn into_masked_inputs(self) -> Vec<F2>;
 }
 
-pub trait MsgRound3 {
+pub trait InputMsg3 {
     type Decoder;
 
     fn into_labels_and_decoder(self) -> (Vec<F128b>, Self::Decoder);
 }
+
+pub trait ExtractOutputMsg1 {
+    type OM1: OutputMsg1;
+
+    fn extract_outupt_msg1<R: Rng + CryptoRng>(&self, rng: &mut R) -> Vec<Self::OM1>;
+}
+
+pub trait OutputMsg1 {}
+
+pub trait OutputMsg2 {}
+
+pub struct DummyOutput;
+
+impl OutputMsg1 for DummyOutput {}
+
+impl OutputMsg2 for DummyOutput {}
 
 pub(crate) fn transpose<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
     assert!(!v.is_empty());
@@ -47,7 +64,7 @@ mod test {
     use swanky_field_binary::{F2, F128b};
 
     use crate::{
-        MsgRound2, MsgRound3,
+        ExtractOutputMsg1, InputMsg2, InputMsg3,
         evaluator::{Evaluator, copz::CopzEvaluator, wrk17::Wrk17Evaluator},
         garbler::{Garbler, copz::CopzGarbler, wrk17::Wrk17Garbler},
         prep::InsecurePreprocessor,
@@ -81,7 +98,16 @@ mod test {
 
     fn run_and_check<
         G: Garbler + Send + 'static,
-        E: Evaluator<Gc = G::Gc, Label = F128b, Decoder = <<G as Garbler>::MR3 as MsgRound3>::Decoder>,
+        E: Evaluator<
+                Gc = G::Gc,
+                Label = F128b,
+                Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
+                OM1 = G::OM1,
+                OM2 = G::OM2,
+                GarbledOutput = EO,
+                // <<GarbledOutput as ExtractOutputMsg1>::OM1 = G::OM1>,
+            >,
+        EO: ExtractOutputMsg1<OM1 = G::OM1>,
     >(
         mut garblers: Vec<G>,
         circuit: &Circuit,
@@ -138,8 +164,19 @@ mod test {
             .eval(circuit, gcs, masked_inputs, msgs_round3)
             .unwrap();
 
+        let mut rng = AesRng::new();
+        let output_msgs_1 = encoded_output.extract_outupt_msg1(&mut rng);
+
+        let output_msgs2 = garblers
+            .into_iter()
+            .zip(output_msgs_1)
+            .map(|(garbler, msg1)| garbler.check_output_msg1(msg1).unwrap())
+            .collect_vec();
+
         // now we need to decode the output
-        let final_result = evaluator.decode(encoded_output, decoder).unwrap();
+        let final_result = evaluator
+            .check_and_decode(output_msgs2, encoded_output, decoder)
+            .unwrap();
 
         let plain_eval_inputs = true_inputs
             .iter()
@@ -177,7 +214,7 @@ mod test {
             .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        run_and_check::<_, Wrk17Evaluator>(garblers, circuit, true_inputs);
+        run_and_check::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs);
 
         // shutdown
         prep_handler.join().unwrap();
@@ -197,7 +234,7 @@ mod test {
             .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        run_and_check::<_, CopzEvaluator>(garblers, circuit, true_inputs);
+        run_and_check::<_, CopzEvaluator, _>(garblers, circuit, true_inputs);
 
         // shutdown
         prep_handler.join().unwrap();

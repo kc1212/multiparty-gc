@@ -1,9 +1,11 @@
 use bristol_fashion::{Circuit, Gate};
 use itertools::{Itertools, izip};
+use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
+    DummyOutput, ExtractOutputMsg1,
     error::GcError,
     garbler::wrk17::{Wrk17EvaluatorOutput, Wrk17Garbling, decrypt_garbled_gate},
     sharing::AuthShare,
@@ -27,10 +29,20 @@ pub struct Wrk17EncodedOutput {
     masked_output_values: Vec<F2>,
 }
 
+impl ExtractOutputMsg1 for Wrk17EncodedOutput {
+    type OM1 = DummyOutput;
+
+    fn extract_outupt_msg1<R: Rng + CryptoRng>(&self, _rng: &mut R) -> Vec<DummyOutput> {
+        vec![]
+    }
+}
+
 impl Evaluator for Wrk17Evaluator {
     type Gc = Wrk17Garbling;
     type Label = F128b;
     type GarbledOutput = Wrk17EncodedOutput;
+    type OM1 = DummyOutput;
+    type OM2 = DummyOutput;
 
     // To decode, each party needs to send
     // { (r^i_w, M_1[r^i_w]) } to the evaluator
@@ -182,8 +194,9 @@ impl Evaluator for Wrk17Evaluator {
     }
 
     /// - `decoder`: decoder[i][w] where i is the party and w is the wire
-    fn decode(
+    fn check_and_decode(
         &self,
+        _output_msg2: Vec<DummyOutput>,
         encoded: Wrk17EncodedOutput,
         decoder: Vec<Vec<(F2, F128b)>>,
     ) -> Result<Vec<F2>, GcError> {
