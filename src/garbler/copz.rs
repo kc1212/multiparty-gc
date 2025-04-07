@@ -1,4 +1,7 @@
-use std::io::{BufRead, Cursor, Read, Write};
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, Cursor, Read, Write},
+};
 
 use bristol_fashion::{Circuit, Gate};
 use generic_array::GenericArray;
@@ -41,8 +44,16 @@ pub struct CopzGarbler<P: Preprocessor> {
     // Input labels created by the garbler.
     input_labels: Vec<F128b>,
 
-    // This is for the output decoder, basically the output wire masks.
+    // This is for the output decoder, basically the shares of output wire masks.
     output_decoder: Vec<F2>,
+
+    // This is all the wire labels of AND gates that we need
+    // for the check step.
+    and_wire_labels: Vec<F128b>,
+
+    r1_delta_1: Vec<F128b>,
+    r2_0_delta_1: Vec<F128b>,
+    r2_1_delta_1: Vec<F128b>,
 }
 
 impl<P: Preprocessor> CopzGarbler<P> {
@@ -55,6 +66,10 @@ impl<P: Preprocessor> CopzGarbler<P> {
             input_shares: vec![],
             input_labels: vec![],
             output_decoder: vec![],
+            and_wire_labels: vec![],
+            r1_delta_1: vec![],
+            r2_0_delta_1: vec![],
+            r2_1_delta_1: vec![],
         }
     }
 }
@@ -446,6 +461,13 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                     let r2_0 = &lambda_uv + lambda_w;
                     let r2_1 = &r2_0 + lambda_u;
 
+                    self.r1_delta_1
+                        .push(r1.to_x_delta_i_share(self.num_parties - 1, &F128b::ZERO));
+                    self.r2_0_delta_1
+                        .push(r2_0.to_x_delta_i_share(self.num_parties - 1, &F128b::ZERO));
+                    self.r2_1_delta_1
+                        .push(r2_1.to_x_delta_i_share(self.num_parties - 1, &F128b::ZERO));
+
                     if self.is_garbler() {
                         let k_u_0 = wire_labels[a];
                         let k_v_0 = wire_labels[b];
@@ -463,6 +485,8 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                             self.num_parties,
                         );
                         garbler_output.push(garbled_table);
+
+                        self.and_wire_labels.push(k_w_0);
 
                         if self.party_id == 0 {
                             b_w_output.push(lsb_f128b(&k_w_0));
@@ -594,8 +618,24 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         }
     }
 
-    fn check_output_msg1(&self, _msg1: CopzOutputMsg1) -> Result<CopzOutputMsg2, GcError> {
-        // TODO
+    fn check_output_msg1(&self, msg1: CopzOutputMsg1) -> Result<CopzOutputMsg2, GcError> {
+        // we assume the opened \hat{w} is correct, i.e., opened with MAC check
+        let CopzOutputMsg1 { w_hats, h, chi } = msg1;
+        let mut hasher = blake3::Hasher::new();
+
+        for (w_hat, label) in w_hats.iter().zip(&self.and_wire_labels) {
+            hasher.update(&(*w_hat * self.delta + label).to_bytes());
+        }
+
+        let h_actual = hasher.finalize().as_bytes().to_vec();
+        if h_actual != h.to_vec() {
+            return Err(GcError::OutputCheckFailure(
+                "hash mismatch on garbler".to_string(),
+            ));
+        }
+
+        // TODO produce CopzOutputMsg2
+
         Ok(CopzOutputMsg2)
     }
 }

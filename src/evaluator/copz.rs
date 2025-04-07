@@ -31,6 +31,7 @@ pub struct CopzEvaluator {
 
 pub struct CopzEncodedOutput {
     masked_output_values: Vec<F2>,
+    masked_and_gates: Vec<F2>,
     digests: Vec<[u8; 32]>,
 }
 
@@ -43,7 +44,7 @@ impl ExtractOutputMsg1 for CopzEncodedOutput {
         self.digests
             .iter()
             .map(|h| CopzOutputMsg1 {
-                w_hats: self.masked_output_values.clone(),
+                w_hats: self.masked_and_gates.clone(),
                 h: *h,
                 chi,
             })
@@ -117,6 +118,8 @@ impl Evaluator for CopzEvaluator {
                 .collect_vec(),
         );
 
+        let mut masked_and_gates = vec![];
+
         // Evaluate the gates, at the same time compute h^i = H({k^i_{w, \hat{w}}})
         let mut hashers = (0..self.num_parties - 1)
             .map(|_| {
@@ -155,7 +158,7 @@ impl Evaluator for CopzEvaluator {
                     let lambda_v_delta_i = lambda_v.to_x_delta_shares(&self.delta);
                     let lambda_uv_delta_i = lambda_uv.to_x_delta_shares(&self.delta);
 
-                    let (new_share, new_labels) = decrypt_garbled_gate(
+                    let (w_hat, new_labels) = decrypt_garbled_gate(
                         &garblings[and_gate_ctr],
                         &labels[*a as usize],
                         &labels[*b as usize],
@@ -169,14 +172,16 @@ impl Evaluator for CopzEvaluator {
                         *out,
                         self.num_parties,
                     );
-                    masked_wire_values[*out as usize] = new_share;
+                    masked_wire_values[*out as usize] = w_hat;
                     #[cfg(test)]
                     {
                         println!(
                             "\tobtained masked_gamma={:?} with label={:?}",
-                            new_share, &new_labels
+                            w_hat, &new_labels
                         );
                     }
+
+                    masked_and_gates.push(w_hat);
 
                     debug_assert_eq!(labels[*out as usize].len(), new_labels.len());
                     debug_assert!(labels[*out as usize].iter().all(|x| *x == F128b::ZERO));
@@ -204,6 +209,7 @@ impl Evaluator for CopzEvaluator {
 
         Ok(CopzEncodedOutput {
             masked_output_values,
+            masked_and_gates,
             digests: hashers
                 .into_iter()
                 .map(|hasher| {

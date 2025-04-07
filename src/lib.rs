@@ -1,4 +1,8 @@
+use std::io::Read;
+
+use generic_array::GenericArray;
 use rand::{CryptoRng, Rng};
+use scuttlebutt::{ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
 pub mod error;
@@ -51,6 +55,29 @@ pub(crate) fn transpose<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
                 .collect::<Vec<T>>()
         })
         .collect()
+}
+
+pub fn universal_hash(chi: &[u8; 32], elements: &[F128b]) -> F128b {
+    let n = elements.len();
+
+    // expand chi into n elements
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"UNIVERSAL_HASH");
+    hasher.update(chi);
+    let mut hreader = hasher.finalize_xof();
+
+    let xs = (0..n).map(|_| {
+        // TODO avoid creating this temporary buffer
+        let mut buf = GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
+        hreader.read_exact(&mut buf).unwrap();
+        F128b::from_bytes(&buf).unwrap()
+    });
+
+    elements
+        .iter()
+        .zip(xs)
+        .map(|(e, x)| e * x)
+        .fold(F128b::ZERO, |acc, x| acc + x)
 }
 
 #[cfg(test)]

@@ -20,6 +20,8 @@ pub enum GcError {
     DecoderLengthError,
     #[error("Input round 2 MAC check failure")]
     InputRound2CheckFailure,
+    #[error("Output check failure {0}")]
+    OutputCheckFailure(String),
 }
 
 impl<T> From<SendError<T>> for GcError {
