@@ -11,10 +11,6 @@ pub mod garbler;
 pub mod prep;
 pub mod sharing;
 
-pub trait GcPrf {
-    fn run(&self, key: F128b, player: usize, gate: usize) -> F128b;
-}
-
 pub trait InputMsg1 {}
 
 pub trait InputMsg2 {
@@ -33,13 +29,19 @@ pub trait ExtractOutputMsg1 {
     fn extract_outupt_msg1<R: Rng + CryptoRng>(&self, rng: &mut R) -> Vec<Self::OM1>;
 }
 
-pub trait OutputMsg1 {}
+pub trait OutputMsg1 {
+    fn chi(&self) -> [u8; 32];
+}
 
 pub trait OutputMsg2 {}
 
 pub struct DummyOutput;
 
-impl OutputMsg1 for DummyOutput {}
+impl OutputMsg1 for DummyOutput {
+    fn chi(&self) -> [u8; 32] {
+        [0u8; 32]
+    }
+}
 
 impl OutputMsg2 for DummyOutput {}
 
@@ -57,6 +59,7 @@ pub(crate) fn transpose<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
         .collect()
 }
 
+// TODO consider using carryless multiplication
 pub fn universal_hash(chi: &[u8; 32], elements: &[F128b]) -> F128b {
     let n = elements.len();
 
@@ -91,7 +94,7 @@ mod test {
     use swanky_field_binary::{F2, F128b};
 
     use crate::{
-        ExtractOutputMsg1, InputMsg2, InputMsg3,
+        ExtractOutputMsg1, InputMsg2, InputMsg3, OutputMsg1,
         evaluator::{Evaluator, copz::CopzEvaluator, wrk17::Wrk17Evaluator},
         garbler::{Garbler, copz::CopzGarbler, wrk17::Wrk17Garbler},
         prep::InsecurePreprocessor,
@@ -188,21 +191,30 @@ mod test {
 
         let evaluator = E::from_garbling(evaluator_gc);
         let encoded_output = evaluator
-            .eval(circuit, gcs, masked_inputs, msgs_round3)
+            .eval(circuit, gcs, masked_inputs.clone(), msgs_round3)
             .unwrap();
 
         let mut rng = AesRng::new();
         let output_msgs_1 = encoded_output.extract_outupt_msg1(&mut rng);
+        let chi = if output_msgs_1.is_empty() {
+            [0u8; 32]
+        } else {
+            output_msgs_1[0].chi()
+        };
 
         let output_msgs2 = garblers
             .into_iter()
             .zip(output_msgs_1)
-            .map(|(garbler, msg1)| garbler.check_output_msg1(msg1).unwrap())
+            .map(|(garbler, msg1)| {
+                garbler
+                    .check_output_msg1(msg1, &masked_inputs, circuit)
+                    .unwrap()
+            })
             .collect_vec();
 
         // now we need to decode the output
         let final_result = evaluator
-            .check_and_decode(output_msgs2, encoded_output, decoder)
+            .check_and_decode(output_msgs2, &chi, encoded_output, decoder, circuit)
             .unwrap();
 
         let plain_eval_inputs = true_inputs

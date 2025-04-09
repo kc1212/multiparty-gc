@@ -428,6 +428,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                     let bit_a = &auth_bits[a];
                     let bit_b = &auth_bits[b];
                     let bit_out = &auth_bits[out];
+                    // TODO batch this auth_mul
                     let auth_prod = self.preprocessor.auth_mul(bit_a, bit_b).unwrap();
 
                     // a = 0, b = 0: \lambda_a \lambda_b + \lambda_\gamma
@@ -641,7 +642,12 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         }
     }
 
-    fn check_output_msg1(&self, _msg1: Self::OM1) -> Result<Self::OM2, GcError> {
+    fn check_output_msg1(
+        &self,
+        _msg1: Self::OM1,
+        _masked_inputs: &[F2],
+        _circuit: &Circuit,
+    ) -> Result<Self::OM2, GcError> {
         Ok(DummyOutput)
     }
 }

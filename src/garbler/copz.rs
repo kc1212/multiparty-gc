@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    io::{BufRead, Cursor, Read, Write},
-};
+use std::io::{BufRead, Cursor, Read, Write};
 
 use bristol_fashion::{Circuit, Gate};
 use generic_array::GenericArray;
@@ -12,7 +9,7 @@ use swanky_field_binary::{F2, F128b};
 
 use crate::{
     InputMsg1, InputMsg2, InputMsg3, OutputMsg1, OutputMsg2, error::GcError,
-    garbler::auth_bits_from_prep, prep::Preprocessor, sharing::AuthShare,
+    garbler::auth_bits_from_prep, prep::Preprocessor, sharing::AuthShare, universal_hash,
 };
 
 use super::{Garbler, Garbling};
@@ -25,10 +22,16 @@ pub struct CopzOutputMsg1 {
     pub(crate) chi: [u8; 32],
 }
 
-impl OutputMsg1 for CopzOutputMsg1 {}
+impl OutputMsg1 for CopzOutputMsg1 {
+    fn chi(&self) -> [u8; 32] {
+        self.chi
+    }
+}
 
 /// P_i sends z^i = H_X({<t_g \Delta^1>}_g) to P_1.
-pub struct CopzOutputMsg2;
+pub struct CopzOutputMsg2 {
+    pub(crate) z_i: F128b,
+}
 
 impl OutputMsg2 for CopzOutputMsg2 {}
 
@@ -454,6 +457,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                 Gate::AND { a, b, out } => {
                     let lambda_u = &auth_bits[a];
                     let lambda_v = &auth_bits[b];
+                    // TODO batch this auth_mul
                     let lambda_uv = self.preprocessor.auth_mul(lambda_u, lambda_v).unwrap();
                     let lambda_w = &auth_bits[out];
 
@@ -618,7 +622,12 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         }
     }
 
-    fn check_output_msg1(&self, msg1: CopzOutputMsg1) -> Result<CopzOutputMsg2, GcError> {
+    fn check_output_msg1(
+        &self,
+        msg1: CopzOutputMsg1,
+        masked_inputs: &[F2],
+        circuit: &Circuit,
+    ) -> Result<CopzOutputMsg2, GcError> {
         // we assume the opened \hat{w} is correct, i.e., opened with MAC check
         let CopzOutputMsg1 { w_hats, h, chi } = msg1;
         let mut hasher = blake3::Hasher::new();
@@ -634,9 +643,43 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
             ));
         }
 
-        // TODO produce CopzOutputMsg2
+        let gate_count = circuit.gates().len();
+        let mut masked_wire_values = [masked_inputs.to_vec(), vec![F2::ZERO; gate_count]].concat();
 
-        Ok(CopzOutputMsg2)
+        let mut and_gate_counter = 0usize;
+        let mut t_g_delta_1 = vec![];
+        for gate in circuit.gates() {
+            match gate {
+                Gate::INV { a, out } => {
+                    masked_wire_values[*out as usize] = masked_wire_values[*a as usize] + F2::ONE;
+                }
+                Gate::XOR { a, b, out } => {
+                    let u_hat = masked_wire_values[*a as usize];
+                    let v_hat = masked_wire_values[*b as usize];
+                    masked_wire_values[*out as usize] = u_hat + v_hat;
+                }
+                Gate::AND { a, b, out } => {
+                    masked_wire_values[*out as usize] = w_hats[and_gate_counter];
+
+                    // <t_g \Delta^1>_i := \hat{u} <r_1 \Delta^1>_i + <r_{2, \hat{v}} \Delta^1>_i
+                    let u_hat = masked_wire_values[*a as usize];
+                    let v_hat = masked_wire_values[*b as usize];
+                    t_g_delta_1.push(
+                        u_hat * self.r1_delta_1[and_gate_counter]
+                            + (F2::ONE - v_hat) * self.r2_0_delta_1[and_gate_counter]
+                            + v_hat * self.r2_1_delta_1[and_gate_counter],
+                    );
+                    and_gate_counter += 1;
+                }
+                bad_gate => {
+                    panic!("unimplemented for gate {bad_gate:?}")
+                }
+            }
+        }
+
+        let z_i = universal_hash(&chi, &t_g_delta_1);
+
+        Ok(CopzOutputMsg2 { z_i })
     }
 }
 

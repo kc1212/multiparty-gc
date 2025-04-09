@@ -28,7 +28,9 @@ pub trait Evaluator {
     fn check_and_decode(
         &self,
         output_msg2: Vec<Self::OM2>,
+        chi: &[u8; 32],
         encoded: Self::GarbledOutput,
         decoder: Vec<Self::Decoder>,
+        circuit: &Circuit,
     ) -> Result<Vec<F2>, GcError>;
 }

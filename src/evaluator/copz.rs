@@ -12,7 +12,7 @@ use crate::{
         CopzEvaluatorOutput, CopzGarbling, CopzOutputMsg1, CopzOutputMsg2, decrypt_garbled_gate,
     },
     sharing::AuthShare,
-    transpose,
+    transpose, universal_hash,
 };
 
 use super::Evaluator;
@@ -30,8 +30,10 @@ pub struct CopzEvaluator {
 }
 
 pub struct CopzEncodedOutput {
+    // TODO the masked output and the and gate values are redundant
     masked_output_values: Vec<F2>,
     masked_and_gates: Vec<F2>,
+    masked_wire_values: Vec<F2>,
     digests: Vec<[u8; 32]>,
 }
 
@@ -83,7 +85,7 @@ impl Evaluator for CopzEvaluator {
         garblings: Vec<CopzGarbling>,
         masked_inputs: Vec<F2>,
         input_labels: Vec<Vec<F128b>>,
-    ) -> Result<Self::GarbledOutput, GcError> {
+    ) -> Result<CopzEncodedOutput, GcError> {
         // party with index n - 1 is the evaluator
         let party_count = garblings.len() + 1;
         let input_len: u64 = circuit.input_sizes().iter().sum();
@@ -210,6 +212,7 @@ impl Evaluator for CopzEvaluator {
         Ok(CopzEncodedOutput {
             masked_output_values,
             masked_and_gates,
+            masked_wire_values,
             digests: hashers
                 .into_iter()
                 .map(|hasher| {
@@ -222,9 +225,11 @@ impl Evaluator for CopzEvaluator {
 
     fn check_and_decode(
         &self,
-        _output_msg2: Vec<Self::OM2>,
+        output_msg2: Vec<CopzOutputMsg2>,
+        chi: &[u8; 32],
         encoded: CopzEncodedOutput,
         decoder: Vec<Vec<F2>>,
+        circuit: &Circuit,
     ) -> Result<Vec<F2>, GcError> {
         if decoder.len() != self.num_parties as usize - 1 {
             eprintln!("decoder.len != num_parties - 1");
@@ -238,6 +243,8 @@ impl Evaluator for CopzEvaluator {
             eprintln!("masked_output_values.len != wire_mask_shares.len()");
             return Err(GcError::DecoderLengthError);
         }
+
+        self.check_universal_hash(&output_msg2, &encoded.masked_wire_values, chi, circuit)?;
 
         let decoder = transpose(decoder);
 
@@ -257,5 +264,66 @@ impl Evaluator for CopzEvaluator {
         })
         .collect_vec();
         Ok(res)
+    }
+}
+
+impl CopzEvaluator {
+    fn check_universal_hash(
+        &self,
+        msgs: &[CopzOutputMsg2],
+        masked_wire_values: &[F2],
+        chi: &[u8; 32],
+        circuit: &Circuit,
+    ) -> Result<(), GcError> {
+        let mut and_gate_counter = 0usize;
+        let mut t_g_delta_1 = vec![];
+        for gate in circuit.gates() {
+            match gate {
+                Gate::INV { a: _, out: _ } => {}
+                Gate::XOR { a: _, b: _, out: _ } => {}
+                Gate::AND { a, b, out } => {
+                    let [lambda_u, lambda_v, lambda_uv, lambda_w] =
+                        &self.garbling_shares[and_gate_counter];
+
+                    // TODO can we skip this computation?
+                    let r1_delta = lambda_v.to_x_delta_i_share(self.num_parties - 1, &self.delta);
+                    let r2_0_delta = lambda_w.to_x_delta_i_share(self.num_parties - 1, &self.delta)
+                        + lambda_uv.to_x_delta_i_share(self.num_parties - 1, &self.delta);
+                    let r2_1_delta =
+                        r2_0_delta + lambda_u.to_x_delta_i_share(self.num_parties - 1, &self.delta);
+
+                    let u_hat = masked_wire_values[*a as usize];
+                    let v_hat = masked_wire_values[*b as usize];
+                    let w_hat = masked_wire_values[*out as usize];
+
+                    t_g_delta_1.push(
+                        u_hat * r1_delta
+                            + (F2::ONE - v_hat) * r2_0_delta
+                            + v_hat * r2_1_delta
+                            + (u_hat * v_hat + w_hat) * self.delta,
+                    );
+
+                    and_gate_counter += 1;
+                }
+                bad_gate => {
+                    panic!("unimplemented for gate {bad_gate:?}")
+                }
+            }
+        }
+
+        let z_1 = universal_hash(chi, &t_g_delta_1);
+
+        let actual = msgs
+            .iter()
+            .map(|m| m.z_i)
+            .fold(F128b::ZERO, |acc, x| acc + x)
+            + z_1;
+        if actual == F128b::ZERO {
+            Ok(())
+        } else {
+            Err(GcError::OutputCheckFailure(format!(
+                "ferrot checked failed in evaluator, got {actual:?}, expected zero"
+            )))
+        }
     }
 }

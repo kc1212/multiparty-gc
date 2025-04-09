@@ -43,7 +43,12 @@ pub trait Garbler {
     }
 
     /// - `msg1`: from the evaluator, that the garbler needs to verify
-    fn check_output_msg1(&self, msg1: Self::OM1) -> Result<Self::OM2, GcError>;
+    fn check_output_msg1(
+        &self,
+        msg1: Self::OM1,
+        masked_inputs: &[F2],
+        circuit: &Circuit,
+    ) -> Result<Self::OM2, GcError>;
 
     fn gen_labels<R>(&mut self, rng: &mut R, circuit: &Circuit) -> BTreeMap<u64, F128b>
     where

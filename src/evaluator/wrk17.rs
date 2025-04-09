@@ -197,8 +197,10 @@ impl Evaluator for Wrk17Evaluator {
     fn check_and_decode(
         &self,
         _output_msg2: Vec<DummyOutput>,
+        _chi: &[u8; 32],
         encoded: Wrk17EncodedOutput,
         decoder: Vec<Vec<(F2, F128b)>>,
+        _circuit: &Circuit,
     ) -> Result<Vec<F2>, GcError> {
         if decoder.len() != self.num_parties as usize - 1 {
             eprintln!("decoder.len != num_parties - 1");
