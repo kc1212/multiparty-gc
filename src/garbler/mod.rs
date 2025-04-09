@@ -31,7 +31,7 @@ pub trait Garbler {
     /// Called by the evaluator, messages are sent to the garblers.
     fn input_round_2(
         &self,
-        true_inputs: Vec<F2>,
+        true_inputs: &[F2],
         msgs: Vec<Self::IM1>,
     ) -> Result<Vec<Self::IM2>, GcError>;
 

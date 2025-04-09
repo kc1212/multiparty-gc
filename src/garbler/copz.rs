@@ -567,7 +567,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
     fn input_round_2(
         &self,
-        true_inputs: Vec<F2>,
+        true_inputs: &[F2],
         msgs: Vec<CopzInputMsg1>,
     ) -> Result<Vec<CopzInputMsg2>, GcError> {
         debug_assert_eq!(self.party_id, self.num_parties - 1);
@@ -576,7 +576,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         println!("True inputs: {true_inputs:?}");
 
         // Reconstruct the \lambda_w shares
-        let mut output = true_inputs;
+        let mut output = true_inputs.to_vec();
         for CopzInputMsg1 { shares } in msgs.into_iter() {
             debug_assert_eq!(output.len(), shares.len());
             // TODO no MAC check here?

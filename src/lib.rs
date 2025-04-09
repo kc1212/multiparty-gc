@@ -1,8 +1,12 @@
 use std::io::Read;
 
+use bristol_fashion::Circuit;
+use evaluator::Evaluator;
+use garbler::Garbler;
 use generic_array::GenericArray;
-use rand::{CryptoRng, Rng};
-use scuttlebutt::{ring::FiniteRing, serialization::CanonicalSerialize};
+use itertools::Itertools;
+use rand::{CryptoRng, Rng, SeedableRng};
+use scuttlebutt::{AesRng, ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
 pub mod error;
@@ -83,140 +87,145 @@ pub fn universal_hash(chi: &[u8; 32], elements: &[F128b]) -> F128b {
         .fold(F128b::ZERO, |acc, x| acc + x)
 }
 
-#[cfg(test)]
-mod test {
-    use std::io::BufReader;
+pub struct EvaluationMaterial<E: Evaluator> {
+    evaluator: E,
+    gcs: Vec<E::Gc>,
+    masked_inputs: Vec<F2>,
+    input_labels: Vec<Vec<E::Label>>,
+    decoder: Vec<E::Decoder>,
+}
 
-    use bristol_fashion::Circuit;
-    use itertools::Itertools;
-    use rand::SeedableRng;
-    use scuttlebutt::{AesRng, ring::FiniteRing, serialization::CanonicalSerialize};
-    use swanky_field_binary::{F2, F128b};
-
-    use crate::{
-        ExtractOutputMsg1, InputMsg2, InputMsg3, OutputMsg1,
-        evaluator::{Evaluator, copz::CopzEvaluator, wrk17::Wrk17Evaluator},
-        garbler::{Garbler, copz::CopzGarbler, wrk17::Wrk17Garbler},
-        prep::InsecurePreprocessor,
-    };
-
-    fn eval_clear_circuit(circuit: &Circuit, inputs: Vec<u8>) -> Vec<u8> {
-        let wire_count = circuit.nwires() as usize;
-        let total_inputs: u64 = circuit.input_sizes().iter().sum();
-        assert_eq!(inputs.len() as u64, total_inputs);
-
-        let mut buffer = [inputs, vec![0u8; wire_count - total_inputs as usize]].concat();
-        for gate in circuit.gates() {
-            match gate {
-                bristol_fashion::Gate::XOR { a, b, out } => {
-                    buffer[*out as usize] = buffer[*a as usize] ^ buffer[*b as usize];
-                }
-                bristol_fashion::Gate::AND { a, b, out } => {
-                    buffer[*out as usize] = buffer[*a as usize] & buffer[*b as usize];
-                }
-                bristol_fashion::Gate::INV { a, out } => {
-                    buffer[*out as usize] = buffer[*a as usize] ^ 1;
-                }
-                bristol_fashion::Gate::EQ { lit: _, out: _ } => unimplemented!(),
-                bristol_fashion::Gate::EQW { a: _, out: _ } => unimplemented!(),
-            }
+pub fn simulate_until_eval<
+    G: Garbler + Send + 'static,
+    E: Evaluator<
+            Gc = G::Gc,
+            Label = F128b,
+            Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
+            OM1 = G::OM1,
+            OM2 = G::OM2,
+            GarbledOutput = EO,
+        >,
+    EO: ExtractOutputMsg1<OM1 = G::OM1>,
+>(
+    garblers: &mut Vec<G>,
+    circuit: &Circuit,
+    true_inputs: &[F2],
+) -> EvaluationMaterial<E>
+where
+    <G as Garbler>::Gc: Send,
+{
+    // We use scoped threads so that we can borrow non-static data and
+    // garble in parallel.
+    let mut gcs = std::thread::scope(|s| {
+        let mut handles = vec![];
+        for (i, garbler) in garblers.iter_mut().enumerate() {
+            handles.push(s.spawn(move || {
+                let mut rng = AesRng::from_entropy();
+                (garbler.garble(&mut rng, circuit), i)
+            }));
         }
 
-        let output_len: u64 = circuit.output_sizes().iter().sum();
-        buffer.split_off(wire_count - output_len as usize)
+        let mut gcs = vec![];
+        for handle in handles {
+            let (gc, _i) = handle.join().unwrap();
+            #[cfg(test)]
+            println!("Joined garbler {_i}");
+            gcs.push(gc);
+        }
+        gcs
+    });
+
+    let final_garbler = garblers.pop().unwrap();
+    let evaluator_gc = gcs.pop().unwrap();
+
+    // do the first round of communication
+    // the garblers (n-1 of them) send a message to the evaluator
+    let msgs_round1 = garblers
+        .iter()
+        .map(|garbler| garbler.input_round_1())
+        .collect_vec();
+
+    // do the second round of communication
+    // the evaluator processes the messages and then creates the response
+    let msgs_round2 = final_garbler
+        .input_round_2(true_inputs, msgs_round1)
+        .unwrap();
+    let masked_inputs = msgs_round2[0].clone().into_masked_inputs();
+
+    // do the final round of communication
+    let (msgs_round3, decoder): (Vec<Vec<F128b>>, Vec<_>) = garblers
+        .iter()
+        .zip(msgs_round2)
+        .map(|(garbler, msg)| garbler.input_round_3(msg).into_labels_and_decoder())
+        .unzip();
+
+    let evaluator = E::from_garbling(evaluator_gc);
+
+    EvaluationMaterial {
+        evaluator,
+        gcs,
+        masked_inputs,
+        input_labels: msgs_round3,
+        decoder,
     }
+}
 
-    fn run_and_check<
-        G: Garbler + Send + 'static,
-        E: Evaluator<
-                Gc = G::Gc,
-                Label = F128b,
-                Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
-                OM1 = G::OM1,
-                OM2 = G::OM2,
-                GarbledOutput = EO,
-                // <<GarbledOutput as ExtractOutputMsg1>::OM1 = G::OM1>,
-            >,
-        EO: ExtractOutputMsg1<OM1 = G::OM1>,
-    >(
-        mut garblers: Vec<G>,
-        circuit: &Circuit,
-        true_inputs: Vec<F2>,
-    ) where
-        <G as Garbler>::Gc: Send,
-    {
-        // We use scoped threads so that we can borrow non-static data and
-        // garble in parallel.
-        let mut gcs = std::thread::scope(|s| {
-            let mut handles = vec![];
-            for (i, garbler) in garblers.iter_mut().enumerate() {
-                handles.push(s.spawn(move || {
-                    let mut rng = AesRng::from_entropy();
-                    (garbler.garble(&mut rng, circuit), i)
-                }));
-            }
+pub fn simulate_eval_and_decode<
+    G: Garbler + Send + 'static,
+    E: Evaluator<
+            Gc = G::Gc,
+            Label = F128b,
+            Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
+            OM1 = G::OM1,
+            OM2 = G::OM2,
+            GarbledOutput = EO,
+        >,
+    EO: ExtractOutputMsg1<OM1 = G::OM1>,
+>(
+    garblers: Vec<G>,
+    circuit: &Circuit,
+    true_inputs: Vec<F2>,
+    eval_material: EvaluationMaterial<E>,
+    check_output: bool,
+) where
+    <G as Garbler>::Gc: Send,
+{
+    let EvaluationMaterial::<E> {
+        evaluator,
+        gcs,
+        masked_inputs,
+        input_labels: msgs_round3,
+        decoder,
+    } = eval_material;
 
-            let mut gcs = vec![];
-            for handle in handles {
-                let (gc, i) = handle.join().unwrap();
-                println!("Joined garbler {i}");
-                gcs.push(gc);
-            }
-            gcs
-        });
+    let encoded_output = evaluator
+        .eval(circuit, gcs, masked_inputs.clone(), msgs_round3)
+        .unwrap();
 
-        let final_garbler = garblers.pop().unwrap();
-        let evaluator_gc = gcs.pop().unwrap();
+    let mut rng = AesRng::new();
+    let output_msgs_1 = encoded_output.extract_outupt_msg1(&mut rng);
+    let chi = if output_msgs_1.is_empty() {
+        [0u8; 32]
+    } else {
+        output_msgs_1[0].chi()
+    };
 
-        // do the first round of communication
-        // the garblers (n-1 of them) send a message to the evaluator
-        let msgs_round1 = garblers
-            .iter()
-            .map(|garbler| garbler.input_round_1())
-            .collect_vec();
+    let output_msgs2 = garblers
+        .into_iter()
+        .zip(output_msgs_1)
+        .map(|(garbler, msg1)| {
+            garbler
+                .check_output_msg1(msg1, &masked_inputs, circuit)
+                .unwrap()
+        })
+        .collect_vec();
 
-        // do the second round of communication
-        // the evaluator processes the messages and then creates the response
-        let msgs_round2 = final_garbler
-            .input_round_2(true_inputs.clone(), msgs_round1)
-            .unwrap();
-        let masked_inputs = msgs_round2[0].clone().into_masked_inputs();
+    // now we need to decode the output
+    let final_result = evaluator
+        .check_and_decode(output_msgs2, &chi, encoded_output, decoder, circuit)
+        .unwrap();
 
-        // do the final round of communication
-        let (msgs_round3, decoder): (Vec<Vec<F128b>>, Vec<_>) = garblers
-            .iter()
-            .zip(msgs_round2)
-            .map(|(garbler, msg)| garbler.input_round_3(msg).into_labels_and_decoder())
-            .unzip();
-
-        let evaluator = E::from_garbling(evaluator_gc);
-        let encoded_output = evaluator
-            .eval(circuit, gcs, masked_inputs.clone(), msgs_round3)
-            .unwrap();
-
-        let mut rng = AesRng::new();
-        let output_msgs_1 = encoded_output.extract_outupt_msg1(&mut rng);
-        let chi = if output_msgs_1.is_empty() {
-            [0u8; 32]
-        } else {
-            output_msgs_1[0].chi()
-        };
-
-        let output_msgs2 = garblers
-            .into_iter()
-            .zip(output_msgs_1)
-            .map(|(garbler, msg1)| {
-                garbler
-                    .check_output_msg1(msg1, &masked_inputs, circuit)
-                    .unwrap()
-            })
-            .collect_vec();
-
-        // now we need to decode the output
-        let final_result = evaluator
-            .check_and_decode(output_msgs2, &chi, encoded_output, decoder, circuit)
-            .unwrap();
-
+    if check_output {
         let plain_eval_inputs = true_inputs
             .iter()
             .map(|x| if *x == F2::ZERO { 0u8 } else { 1u8 })
@@ -228,6 +237,75 @@ mod test {
 
         assert_eq!(final_result, expected_result)
     }
+}
+
+pub fn full_simulation<
+    G: Garbler + Send + 'static,
+    E: Evaluator<
+            Gc = G::Gc,
+            Label = F128b,
+            Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
+            OM1 = G::OM1,
+            OM2 = G::OM2,
+            GarbledOutput = EO,
+        >,
+    EO: ExtractOutputMsg1<OM1 = G::OM1>,
+>(
+    mut garblers: Vec<G>,
+    circuit: &Circuit,
+    true_inputs: Vec<F2>,
+    check_output: bool,
+) where
+    <G as Garbler>::Gc: Send,
+{
+    let eval_material: EvaluationMaterial<E> =
+        simulate_until_eval(&mut garblers, circuit, &true_inputs);
+
+    simulate_eval_and_decode(garblers, circuit, true_inputs, eval_material, check_output);
+}
+
+fn eval_clear_circuit(circuit: &Circuit, inputs: Vec<u8>) -> Vec<u8> {
+    let wire_count = circuit.nwires() as usize;
+    let total_inputs: u64 = circuit.input_sizes().iter().sum();
+    assert_eq!(inputs.len() as u64, total_inputs);
+
+    let mut buffer = [inputs, vec![0u8; wire_count - total_inputs as usize]].concat();
+    for gate in circuit.gates() {
+        match gate {
+            bristol_fashion::Gate::XOR { a, b, out } => {
+                buffer[*out as usize] = buffer[*a as usize] ^ buffer[*b as usize];
+            }
+            bristol_fashion::Gate::AND { a, b, out } => {
+                buffer[*out as usize] = buffer[*a as usize] & buffer[*b as usize];
+            }
+            bristol_fashion::Gate::INV { a, out } => {
+                buffer[*out as usize] = buffer[*a as usize] ^ 1;
+            }
+            bristol_fashion::Gate::EQ { lit: _, out: _ } => unimplemented!(),
+            bristol_fashion::Gate::EQW { a: _, out: _ } => unimplemented!(),
+        }
+    }
+
+    let output_len: u64 = circuit.output_sizes().iter().sum();
+    buffer.split_off(wire_count - output_len as usize)
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::BufReader;
+
+    use bristol_fashion::Circuit;
+    use itertools::Itertools;
+    use scuttlebutt::{AesRng, ring::FiniteRing};
+    use swanky_field_binary::F2;
+
+    use crate::{
+        eval_clear_circuit,
+        evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
+        full_simulation,
+        garbler::{copz::CopzGarbler, wrk17::Wrk17Garbler},
+        prep::InsecurePreprocessor,
+    };
 
     #[test]
     fn test_clear_circuit() {
@@ -253,7 +331,7 @@ mod test {
             .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        run_and_check::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs);
+        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true);
 
         // shutdown
         prep_handler.join().unwrap();
@@ -273,7 +351,7 @@ mod test {
             .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        run_and_check::<_, CopzEvaluator, _>(garblers, circuit, true_inputs);
+        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true);
 
         // shutdown
         prep_handler.join().unwrap();

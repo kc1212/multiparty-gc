@@ -580,7 +580,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
     fn input_round_2(
         &self,
-        true_inputs: Vec<F2>,
+        true_inputs: &[F2],
         msgs: Vec<Wrk17InputMsg1>,
     ) -> Result<Vec<Wrk17InputMsg2>, GcError> {
         debug_assert_eq!(self.party_id, self.num_parties - 1);
@@ -591,7 +591,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         // The evaluator receives r^i_w, M_1[r^i_w]
         // so we find the corresponding MAC key and do a MAC check.
         // Also reconstruct at the same time.
-        let mut output = true_inputs;
+        let mut output = true_inputs.to_vec();
         for (party_id, Wrk17InputMsg1 { macs, shares }) in msgs.into_iter().enumerate() {
             debug_assert_eq!(macs.len(), shares.len());
             debug_assert_eq!(macs.len(), output.len());
