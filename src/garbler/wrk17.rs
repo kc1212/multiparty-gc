@@ -409,24 +409,24 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         for gate in circuit.gates() {
             match gate {
                 Gate::XOR { a, b, out } => {
-                    let output_share = &auth_bits[a] + &auth_bits[b];
-                    assert!(!auth_bits.contains_key(out));
-                    auth_bits.insert(*out, output_share);
+                    let output_share = &auth_bits[*a as usize] + &auth_bits[*b as usize];
+                    assert!(auth_bits[*out as usize].is_empty());
+                    auth_bits[*out as usize] = output_share;
                     if self.is_garbler() {
-                        assert!(!wire_labels.contains_key(out));
-                        wire_labels.insert(*out, wire_labels[a] + wire_labels[b]);
+                        wire_labels[*out as usize] =
+                            wire_labels[*a as usize] + wire_labels[*b as usize];
                     }
                 }
                 Gate::INV { a, out } => {
                     if self.is_garbler() {
-                        wire_labels.insert(*out, wire_labels[a] + self.delta);
+                        wire_labels[*out as usize] = wire_labels[*a as usize] + self.delta;
                     }
-                    auth_bits.insert(*out, auth_bits[a].clone());
+                    auth_bits[*out as usize] = auth_bits[*a as usize].clone();
                 }
                 Gate::AND { a, b, out } => {
-                    let bit_a = &auth_bits[a];
-                    let bit_b = &auth_bits[b];
-                    let bit_out = &auth_bits[out];
+                    let bit_a = &auth_bits[*a as usize];
+                    let bit_b = &auth_bits[*b as usize];
+                    let bit_out = &auth_bits[*out as usize];
                     // TODO batch this auth_mul
                     let auth_prod = self.preprocessor.auth_mul(bit_a, bit_b).unwrap();
 
@@ -449,9 +449,9 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                         tmp
                     };
                     if self.is_garbler() {
-                        let label_a_0 = wire_labels[a];
-                        let label_b_0 = wire_labels[b];
-                        let label_gamma_0 = wire_labels[out];
+                        let label_a_0 = wire_labels[*a as usize];
+                        let label_b_0 = wire_labels[*b as usize];
+                        let label_gamma_0 = wire_labels[*out as usize];
                         let garbled_gate = Wrk17GarbledGate {
                             party_id: self.party_id,
                             rows: [
@@ -508,20 +508,20 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
         // Keep some information that we need for inputs
         let input_wire_count: u64 = circuit.input_sizes().iter().sum();
-        for input_idx in 0..input_wire_count {
+        for input_idx in 0..input_wire_count as usize {
             // Shared by garblers and evaluator
-            let r = auth_bits[&input_idx].share;
+            let r = auth_bits[input_idx].share;
             self.input_shares.push(r);
 
             if !self.is_garbler() {
                 // TODO avoid clone?
                 self.input_keys
-                    .push(auth_bits[&input_idx].mac_keys.iter().cloned().collect_vec());
+                    .push(auth_bits[input_idx].mac_keys.iter().cloned().collect_vec());
             } else {
-                let mac = auth_bits[&input_idx].mac_values[self.num_parties as usize - 1];
+                let mac = auth_bits[input_idx].mac_values[self.num_parties as usize - 1];
                 self.input_macs.push(mac);
 
-                let label = wire_labels[&input_idx];
+                let label = wire_labels[input_idx];
                 self.input_labels.push(label);
             }
         }
@@ -534,8 +534,8 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
             self.output_decoder = (nwires - output_wire_count..nwires)
                 .map(|i| {
                     (
-                        auth_bits[&i].share,
-                        auth_bits[&i].mac_values[self.num_parties as usize - 1],
+                        auth_bits[i as usize].share,
+                        auth_bits[i as usize].mac_values[self.num_parties as usize - 1],
                     )
                 })
                 .collect();
@@ -557,7 +557,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 total_num_parties: self.num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
-                    .map(|i| auth_bits[&i].clone())
+                    .map(|i| auth_bits[i as usize].clone())
                     .collect(),
                 delta: self.delta,
             })

@@ -440,26 +440,27 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         for gate in circuit.gates() {
             match gate {
                 Gate::XOR { a, b, out } => {
-                    let output_share = &auth_bits[a] + &auth_bits[b];
-                    assert!(!auth_bits.contains_key(out));
-                    auth_bits.insert(*out, output_share);
+                    let output_share = &auth_bits[*a as usize] + &auth_bits[*b as usize];
+                    assert!(auth_bits[*out as usize].is_empty());
+                    auth_bits[*out as usize] = output_share;
                     if self.is_garbler() {
-                        assert!(!wire_labels.contains_key(out));
-                        wire_labels.insert(*out, wire_labels[a] + wire_labels[b]);
+                        assert!(wire_labels[*out as usize] == F128b::ZERO);
+                        wire_labels[*out as usize] =
+                            wire_labels[*a as usize] + wire_labels[*b as usize];
                     }
                 }
                 Gate::INV { a, out } => {
                     if self.is_garbler() {
-                        wire_labels.insert(*out, wire_labels[a] + self.delta);
+                        wire_labels[*out as usize] = wire_labels[*a as usize] + self.delta;
                     }
-                    auth_bits.insert(*out, auth_bits[a].clone());
+                    auth_bits[*out as usize] = auth_bits[*a as usize].clone();
                 }
                 Gate::AND { a, b, out } => {
-                    let lambda_u = &auth_bits[a];
-                    let lambda_v = &auth_bits[b];
+                    let lambda_u = &auth_bits[*a as usize];
+                    let lambda_v = &auth_bits[*b as usize];
                     // TODO batch this auth_mul
                     let lambda_uv = self.preprocessor.auth_mul(lambda_u, lambda_v).unwrap();
-                    let lambda_w = &auth_bits[out];
+                    let lambda_w = &auth_bits[*out as usize];
 
                     let r1 = lambda_v;
                     let r2_0 = &lambda_uv + lambda_w;
@@ -473,9 +474,9 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                         .push(r2_1.to_x_delta_i_share(self.num_parties - 1, &F128b::ZERO));
 
                     if self.is_garbler() {
-                        let k_u_0 = wire_labels[a];
-                        let k_v_0 = wire_labels[b];
-                        let k_w_0 = wire_labels[out];
+                        let k_u_0 = wire_labels[*a as usize];
+                        let k_v_0 = wire_labels[*b as usize];
+                        let k_w_0 = wire_labels[*out as usize];
                         let garbled_table = encrypt_garbled_table(
                             r1,
                             &r2_0,
@@ -513,13 +514,13 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
         // Keep some information that we need for inputs
         let input_wire_count: u64 = circuit.input_sizes().iter().sum();
-        for input_idx in 0..input_wire_count {
-            let r = auth_bits[&input_idx].share;
+        for input_idx in 0..input_wire_count as usize {
+            let r = auth_bits[input_idx].share;
             self.input_shares.push(r);
 
             if !self.is_garbler() {
             } else {
-                let label = wire_labels[&input_idx];
+                let label = wire_labels[input_idx];
                 self.input_labels.push(label);
             }
         }
@@ -529,7 +530,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         let nwires = circuit.nwires();
         if self.is_garbler() {
             self.output_decoder = (nwires - output_wire_count..nwires)
-                .map(|i| auth_bits[&i].share)
+                .map(|i| auth_bits[i as usize].share)
                 .collect();
         }
 
@@ -545,7 +546,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                 num_parties: self.num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
-                    .map(|i| auth_bits[&i].clone())
+                    .map(|i| auth_bits[i as usize].clone())
                     .collect(),
                 delta: self.delta,
             })

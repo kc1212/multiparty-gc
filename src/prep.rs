@@ -55,6 +55,7 @@ pub trait Preprocessor: StaticPreprocessor {
     fn prep(&mut self);
 }
 
+#[allow(clippy::large_enum_variant)]
 enum InsecurePreprocessorReq {
     Delta(u16),
     Bits(u16, u64),
@@ -119,6 +120,7 @@ impl InsecurePreprocessorReq {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum InsecurePreprocessorResp {
     Delta(F128b),
     Bits(Vec<AuthShare<F2, F128b>>),

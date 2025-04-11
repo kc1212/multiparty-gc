@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use bristol_fashion::Circuit;
 use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
@@ -50,20 +48,20 @@ pub trait Garbler {
         circuit: &Circuit,
     ) -> Result<Self::OM2, GcError>;
 
-    fn gen_labels<R>(&mut self, rng: &mut R, circuit: &Circuit) -> BTreeMap<u64, F128b>
+    fn gen_labels<R>(&mut self, rng: &mut R, circuit: &Circuit) -> Vec<F128b>
     where
         R: Rng + CryptoRng,
     {
-        let mut output = BTreeMap::new();
+        let mut output = vec![F128b::ZERO; circuit.nwires() as usize];
         let input_length: u64 = circuit.input_sizes().iter().sum();
-        for i in 0..input_length {
-            output.insert(i, F128b::random(rng));
-        }
+        output.iter_mut().take(input_length as usize).for_each(|x| {
+            *x = F128b::random(rng);
+        });
         if self.is_garbler() {
             for gate in circuit.gates() {
                 match gate {
                     bristol_fashion::Gate::AND { a: _, b: _, out } => {
-                        output.insert(*out, F128b::random(rng));
+                        output[*out as usize] = F128b::random(rng);
                     }
                     _ => { /* do nothing */ }
                 }
@@ -78,20 +76,23 @@ pub trait Garbling {}
 pub(crate) fn auth_bits_from_prep<P: Preprocessor>(
     prep: &mut P,
     circuit: &Circuit,
-) -> BTreeMap<u64, AuthShare<F2, F128b>> {
+) -> Vec<AuthShare<F2, F128b>> {
     let input_wire_count: u64 = circuit.input_sizes().iter().sum();
     let and_gate_count = circuit.nand();
 
     // Sample wire masks and labels for input wires
     let mut unindexed_auth_bits = prep.auth_bits(input_wire_count + and_gate_count).unwrap();
-    let mut auth_bits = BTreeMap::new();
-    for i in 0..input_wire_count {
-        auth_bits.insert(i, unindexed_auth_bits.pop().unwrap());
-    }
+    let mut auth_bits = vec![AuthShare::<F2, F128b>::make_empty(); circuit.nwires() as usize];
+    auth_bits
+        .iter_mut()
+        .take(input_wire_count as usize)
+        .for_each(|x| {
+            *x = unindexed_auth_bits.pop().unwrap();
+        });
     for gate in circuit.gates() {
         match gate {
             bristol_fashion::Gate::AND { a: _, b: _, out } => {
-                auth_bits.insert(*out, unindexed_auth_bits.pop().unwrap());
+                auth_bits[*out as usize] = unindexed_auth_bits.pop().unwrap();
             }
             _ => { /* do nothing */ }
         }

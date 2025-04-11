@@ -41,6 +41,19 @@ where
     ShareFF: FiniteField,
     MacFF: FiniteField + CanonicalSerialize,
 {
+    pub fn make_empty() -> Self {
+        Self {
+            party_id: 0,
+            share: ShareFF::ZERO,
+            mac_values: smallvec![],
+            mac_keys: smallvec![],
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mac_keys.is_empty() && self.mac_keys.is_empty()
+    }
+
     pub fn serialize_mac_values<W: Write>(&self, writer: &mut W) {
         // iterating is sorted by key
         for (j, v) in self.mac_values.iter().enumerate() {
