@@ -223,7 +223,7 @@ impl Evaluator for Wrk17Evaluator {
             // Iterate over the parties
             for (i, (share, mac)) in all_shares_macs.iter().enumerate() {
                 // r^i_w, M_1[r^i_w], K_1[r^i_w] is valid
-                let key = key.mac_keys[&(i as u16)];
+                let key = key.mac_keys[i];
                 if *share * self.delta + key != *mac {
                     return Err(GcError::DecoderCheckFailure);
                 }

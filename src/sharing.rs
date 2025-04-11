@@ -5,13 +5,15 @@ use scuttlebutt::{
     field::{FiniteField, IsSubFieldOf},
     serialization::CanonicalSerialize,
 };
+use smallvec::smallvec;
 use std::{
-    collections::BTreeMap,
     io::{Read, Write},
     ops::Add,
 };
 
 use crate::error::GcError;
+
+type GcSmallVec<MacFF> = smallvec::SmallVec<[MacFF; 16]>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthShare<ShareFF, MacFF>
@@ -25,11 +27,13 @@ where
     /// The secret share x^i.
     pub share: ShareFF,
     /// The MACs M_j[x^i], where value M_j[x^i] is under key j.
-    /// The btree is keyed on j (the other party's index).
-    pub mac_values: BTreeMap<u16, MacFF>,
+    /// The it is index by j (the other party's index).
+    /// Value on index i is 0.
+    pub mac_values: GcSmallVec<MacFF>,
     /// The MAC keys K_i[x^j], where value K_i[x^j] is under key i.
-    /// The btree is keyed on j (the other party's index).
-    pub mac_keys: BTreeMap<u16, MacFF>,
+    /// The it is indexed on j (the other party's index).
+    /// Value on index i is 0.
+    pub mac_keys: GcSmallVec<MacFF>,
 }
 
 impl<ShareFF, MacFF> AuthShare<ShareFF, MacFF>
@@ -39,36 +43,36 @@ where
 {
     pub fn serialize_mac_values<W: Write>(&self, writer: &mut W) {
         // iterating is sorted by key
-        for v in self.mac_values.values() {
+        for (j, v) in self.mac_values.iter().enumerate() {
+            if j == self.party_id as usize {
+                continue;
+            }
             writer.write_all(&v.to_bytes()).unwrap();
         }
     }
 
+    /// NOTE: this will overwrite the mac values!
     pub fn deserialize_mac_values<R: Read>(&mut self, party_count: u16, reader: &mut R) {
-        if !self.mac_values.is_empty() {
-            panic!("reading mac values into AuthShare that's not empty")
-        }
         let mut buf = GenericArray::<u8, MacFF::ByteReprLen>::default();
+        self.mac_values = smallvec![MacFF::ZERO; party_count as usize];
         for i in 0..party_count {
             if i != self.party_id {
                 reader
                     .read_exact(&mut buf)
                     .unwrap_or_else(|_| panic!("reading failed for i={i}"));
-                self.mac_values.insert(i, MacFF::from_bytes(&buf).unwrap());
+                self.mac_values[i as usize] = MacFF::from_bytes(&buf).unwrap();
             }
         }
     }
 
     pub fn sum_mac_keys(&self) -> MacFF {
         // Sum trait is not implemented, so we use fold
-        self.mac_keys.values().fold(MacFF::ZERO, |acc, x| acc + *x)
+        self.mac_keys.iter().fold(MacFF::ZERO, |acc, x| acc + *x)
     }
 
     pub fn sum_mac_values(&self) -> MacFF {
         // Sum trait is not implemented, so we use fold
-        self.mac_values
-            .values()
-            .fold(MacFF::ZERO, |acc, x| acc + *x)
+        self.mac_values.iter().fold(MacFF::ZERO, |acc, x| acc + *x)
     }
 
     pub fn check_against_incoming_macs(
@@ -82,9 +86,8 @@ where
         // if MACs are given as a vector
         // we assume they're indexed from 0 to n-2 (length of n-1)
         let final_index = mac_values.len() as u16;
-        assert!(!self.mac_keys.keys().contains(&final_index));
         assert_eq!(self.party_id, final_index);
-        for (key, mac) in self.mac_keys.values().zip(mac_values) {
+        for (key, mac) in self.mac_keys.iter().zip(mac_values) {
             if *mac != (self.share * *delta) + *key {
                 return Err(GcError::MacCheckFailure);
             }
@@ -107,7 +110,7 @@ where
             self.share * *delta_i + self.sum_mac_keys()
         } else {
             // <x \Delta_i>_j = M_j[x^i]
-            self.mac_values[&j]
+            self.mac_values[j as usize]
         }
     }
 
@@ -115,7 +118,7 @@ where
     where
         ShareFF: IsSubFieldOf<MacFF>,
     {
-        let n = self.mac_keys.len() as u16 + 1;
+        let n = self.mac_keys.len() as u16;
         (0..n).map(|i| self.to_x_delta_i_share(i, delta)).collect()
     }
 }
@@ -134,14 +137,16 @@ macro_rules! impl_add {
                 let new_share = self.share + rhs.share;
                 let new_mac_values = self
                     .mac_values
-                    .keys()
-                    .map(|j| (*j, self.mac_values[j] + rhs.mac_values[j]))
-                    .collect::<BTreeMap<_, _>>();
+                    .iter()
+                    .zip(&rhs.mac_values)
+                    .map(|(left, right)| *left + *right)
+                    .collect();
                 let new_mac_keys = self
                     .mac_keys
-                    .keys()
-                    .map(|j| (*j, self.mac_keys[j] + rhs.mac_keys[j]))
-                    .collect::<BTreeMap<_, _>>();
+                    .iter()
+                    .zip(&rhs.mac_keys)
+                    .map(|(left, right)| *left + *right)
+                    .collect();
                 Self::Output {
                     party_id: self.party_id,
                     share: new_share,
@@ -177,12 +182,12 @@ where
     shares[0] = shares[0] + secret - sum_shares;
 
     // all the mac keys, ordered by party
-    let mut mac_keys = Vec::with_capacity((n * n) as usize);
+    let mut mac_keys = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let mut party_i_keys = BTreeMap::new();
+        let mut party_i_keys: GcSmallVec<MacFF> = smallvec![MacFF::ZERO; n as usize];
         for j in 0..n {
             if i != j {
-                party_i_keys.insert(j, MacFF::random(rng));
+                party_i_keys[j as usize] = MacFF::random(rng);
             }
         }
         mac_keys.push(party_i_keys);
@@ -191,12 +196,13 @@ where
     // all the macs, ordered by party
     let mut mac_values = Vec::with_capacity((n * n) as usize);
     for i in 0..n {
-        let mut party_i_macs = BTreeMap::new();
+        let mut party_i_macs: GcSmallVec<MacFF> = smallvec![MacFF::ZERO; n as usize];
         for j in 0..n {
             if i != j {
                 // MAC_j[x^i] = x^i * Delta_j + K_j[x^i]
-                let m_j_i = shares[i as usize] * deltas[j as usize] + mac_keys[j as usize][&i];
-                party_i_macs.insert(j, m_j_i);
+                let m_j_i =
+                    shares[i as usize] * deltas[j as usize] + mac_keys[j as usize][i as usize];
+                party_i_macs[j as usize] = m_j_i;
             }
         }
         mac_values.push(party_i_macs);
@@ -247,9 +253,9 @@ where
     for i in 0..n {
         for j in 0..n {
             if i != j {
-                let m_j_i = shares[i as usize].mac_values[&j];
+                let m_j_i = shares[i as usize].mac_values[j as usize];
                 let delta_j = deltas[j as usize];
-                let k_j_i = shares[j as usize].mac_keys[&i];
+                let k_j_i = shares[j as usize].mac_keys[i as usize];
                 let share_i = shares[i as usize].share;
 
                 if m_j_i != share_i * delta_j + k_j_i {
@@ -310,7 +316,7 @@ mod test {
         let mut writer = Cursor::new(vec![]);
         let share_orig = shares[0].clone();
         let mut share_new = share_orig.clone();
-        share_new.mac_values = BTreeMap::new();
+        share_new.mac_values = smallvec![F128b::ZERO; n as usize];
 
         share_orig.serialize_mac_values(&mut writer);
         assert_eq!(writer.get_ref().len(), (n as usize - 1) * (128 / 8));

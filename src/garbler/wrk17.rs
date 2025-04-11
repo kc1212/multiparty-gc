@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     io::{Cursor, Read, Write},
     ops::Index,
 };
@@ -10,6 +9,7 @@ use itertools::{Itertools, izip};
 use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
 use scuttlebutt::serialization::CanonicalSerialize;
+use smallvec::smallvec;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
@@ -94,7 +94,8 @@ impl Wrk17GarbledRow {
 
         // Use the XOF to encrypt the following byte buffer
         // r^i (1 bit) || {M_j[r^1]} (128 * (n-1) bits) || L_gamma_0 xor (sum K_i[r^j]) xor r^i \Delta_i
-        let output_len = 1 + 128 / 8 * share.mac_keys.len() + 128 / 8;
+        let n = share.mac_keys.len(); // not a perfect proxy, depends on implementation
+        let output_len = 1 + 128 / 8 * (n - 1) + 128 / 8;
         let mut to_encrypt = Cursor::new(Vec::<u8>::with_capacity(output_len));
         let r = share.share;
         to_encrypt.write_all(&r.to_bytes()).unwrap();
@@ -161,12 +162,11 @@ impl Wrk17GarbledRow {
         let mut r_share: AuthShare<_, F128b> = AuthShare {
             party_id,
             share: r,
-            mac_values: BTreeMap::new(),
-            mac_keys: BTreeMap::new(),
+            mac_values: smallvec![F128b::ZERO; party_count as usize],
+            mac_keys: smallvec![F128b::ZERO; party_count as usize],
         };
         // TODO do we need to deserialize everything?
         r_share.deserialize_mac_values(party_count, &mut cursor);
-        assert_eq!(r_share.mac_values.len(), party_count as usize - 1);
 
         // Next we read the encrypted label:
         // L_\gamma^i + (sum K_i[r^j_{\gamma, \ell}]) + r^i_{\gamma, \ell} \Delta_i
@@ -265,9 +265,8 @@ pub(crate) fn decrypt_garbled_gate(
         // perform mac check:
         // r^i_{\gamma, \ell} * \Delta_1 + K_1[r^i_{\gamma, \ell}] = M_1[r^i_{\gamma, \ell}]
         // where i is party_id
-        if r_share.share * evaluator_delta
-            + evaluator_shares[row_id as usize].mac_keys[&(party_id as u16)]
-            != r_share.mac_values[&evaluator_index]
+        if r_share.share * evaluator_delta + evaluator_shares[row_id as usize].mac_keys[party_id]
+            != r_share.mac_values[evaluator_index as usize]
         {
             return Err(GcError::MacCheckFailure);
         }
@@ -283,9 +282,9 @@ pub(crate) fn decrypt_garbled_gate(
         // sum_j M_i[r^j_{\gamma, \ell}] for j != i, this needs to include M_1[...]
         let macs = (0..party_count - 1)
             .filter(|i| *i != party_id)
-            .map(|i| r_shares[i].mac_values[&(party_id as u16)])
+            .map(|i| r_shares[i].mac_values[party_id])
             .fold(F128b::ZERO, |acc, x| acc + x)
-            + evaluator_shares[row_id as usize].mac_values[&(party_id as u16)];
+            + evaluator_shares[row_id as usize].mac_values[party_id];
 
         // Decrypt using the sum of MACs
         let recovered_label = Wrk17GarbledRow::decrypt_label_gamma(enc_label_gamma, macs);
@@ -440,7 +439,9 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                     // a = 1, b = 1: 1 + \lambda_a + \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
                     let share3 = if self.is_garbler() {
                         let mut tmp = &share1 + bit_b;
-                        *tmp.mac_keys.get_mut(&(&self.num_parties - 1)).unwrap() += self.delta;
+                        *tmp.mac_keys
+                            .get_mut((&self.num_parties - 1) as usize)
+                            .unwrap() += self.delta;
                         tmp
                     } else {
                         let mut tmp = &share1 + bit_b;
@@ -514,15 +515,10 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
             if !self.is_garbler() {
                 // TODO avoid clone?
-                self.input_keys.push(
-                    auth_bits[&input_idx]
-                        .mac_keys
-                        .values()
-                        .cloned()
-                        .collect_vec(),
-                );
+                self.input_keys
+                    .push(auth_bits[&input_idx].mac_keys.iter().cloned().collect_vec());
             } else {
-                let mac = auth_bits[&input_idx].mac_values[&(&self.num_parties - 1)];
+                let mac = auth_bits[&input_idx].mac_values[self.num_parties as usize - 1];
                 self.input_macs.push(mac);
 
                 let label = wire_labels[&input_idx];
@@ -539,7 +535,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                 .map(|i| {
                     (
                         auth_bits[&i].share,
-                        auth_bits[&i].mac_values[&(self.num_parties - 1)],
+                        auth_bits[&i].mac_values[self.num_parties as usize - 1],
                     )
                 })
                 .collect();
@@ -692,7 +688,7 @@ mod tests {
             .skip(1)
             .map(|share| {
                 // mac held by party j on share i
-                share.mac_values[&0]
+                share.mac_values[0]
             })
             .sum();
 
