@@ -12,7 +12,7 @@ use crate::{
     garbler::auth_bits_from_prep, prep::Preprocessor, sharing::AuthShare, universal_hash,
 };
 
-use super::{Garbler, Garbling};
+use super::{Garbler, Garbling, process_linear_gates};
 
 /// P_1 broadcasts X, {\hat{w}} to all garblers
 /// Additionally it sends h_i = H({k^i_{w,\hat{w}}}) to P_i
@@ -437,33 +437,43 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
             0
         });
 
+        // first process XOR and INV gates
+        // note that the authenticated bits and labels are updated
+        process_linear_gates(
+            &mut auth_bits,
+            &mut wire_labels,
+            circuit,
+            self.delta,
+            self.is_garbler(),
+        );
+
+        // ask the preprocessor to do authenticated multiplication
+        // for a batch of authenticated bits
+        let indicies_for_mul = circuit
+            .gates()
+            .iter()
+            .filter_map(|gate| match gate {
+                Gate::AND { a, b, out: _ } => Some((*a as usize, *b as usize)),
+                _ => None,
+            })
+            .collect_vec();
+        let auth_prods = self
+            .preprocessor
+            .auth_muls(&auth_bits, &indicies_for_mul)
+            .unwrap();
+
+        let mut and_gate_counter = 0usize;
         for gate in circuit.gates() {
             match gate {
-                Gate::XOR { a, b, out } => {
-                    let output_share = &auth_bits[*a as usize] + &auth_bits[*b as usize];
-                    assert!(auth_bits[*out as usize].is_empty());
-                    auth_bits[*out as usize] = output_share;
-                    if self.is_garbler() {
-                        assert!(wire_labels[*out as usize] == F128b::ZERO);
-                        wire_labels[*out as usize] =
-                            wire_labels[*a as usize] + wire_labels[*b as usize];
-                    }
-                }
-                Gate::INV { a, out } => {
-                    if self.is_garbler() {
-                        wire_labels[*out as usize] = wire_labels[*a as usize] + self.delta;
-                    }
-                    auth_bits[*out as usize] = auth_bits[*a as usize].clone();
-                }
+                Gate::XOR { .. } | Gate::INV { .. } => { /* already processed */ }
                 Gate::AND { a, b, out } => {
                     let lambda_u = &auth_bits[*a as usize];
                     let lambda_v = &auth_bits[*b as usize];
-                    // TODO batch this auth_mul
-                    let lambda_uv = self.preprocessor.auth_mul(lambda_u, lambda_v).unwrap();
+                    let lambda_uv = &auth_prods[and_gate_counter];
                     let lambda_w = &auth_bits[*out as usize];
 
                     let r1 = lambda_v;
-                    let r2_0 = &lambda_uv + lambda_w;
+                    let r2_0 = lambda_uv + lambda_w;
                     let r2_1 = &r2_0 + lambda_u;
 
                     self.r1_delta_1
@@ -504,6 +514,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
                             lambda_w.clone(),
                         ]);
                     }
+                    and_gate_counter += 1;
                 }
                 Gate::EQ { lit: _, out: _ } => unimplemented!("EQ gate not supported"),
                 Gate::EQW { a: _, out: _ } => unimplemented!("EQW gate not supported"),

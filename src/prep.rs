@@ -31,6 +31,19 @@ pub trait StaticPreprocessor {
         y: &AuthShare<F2, F128b>,
     ) -> Result<AuthShare<F2, F128b>, GcError>;
 
+    fn auth_muls(
+        &mut self,
+        shares: &[AuthShare<F2, F128b>],
+        indices: &[(usize, usize)],
+    ) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
+        // default implementation
+        let mut out = Vec::with_capacity(indices.len());
+        for (i, j) in indices {
+            out.push(self.auth_mul(&shares[*i], &shares[*j])?);
+        }
+        Ok(out)
+    }
+
     /// Compute z = x*y and then output unauthenticated shares <x * \Delta^i>
     fn and_output_mask(
         &mut self,

@@ -17,7 +17,7 @@ use crate::{
     prep::Preprocessor, sharing::AuthShare,
 };
 
-use super::{Garbler, Garbling};
+use super::{Garbler, Garbling, process_linear_gates};
 
 /// Garbler for WRK17. Due to the way parties are indexed,
 /// we set the last party (n-1) as the evaluator instead of the first.
@@ -389,9 +389,9 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         R: Rng + CryptoRng,
     {
         self.delta = self.preprocessor.init_delta().unwrap();
-        // these are the authenticated shares of the wire masks
-        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
 
+        // these are the authenticated shares of the wire masks, indexed by the wire ID
+        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
         let mut wire_labels = self.gen_labels(rng, circuit);
 
         let and_gate_count = circuit.nand();
@@ -406,32 +406,44 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
             and_gate_count as usize
         });
 
+        // first process XOR and INV gates
+        // note that the authenticated bits and labels are updated
+        process_linear_gates(
+            &mut auth_bits,
+            &mut wire_labels,
+            circuit,
+            self.delta,
+            self.is_garbler(),
+        );
+
+        // ask the preprocessor to do authenticated multiplication
+        // for a batch of authenticated bits
+        let indicies_for_mul = circuit
+            .gates()
+            .iter()
+            .filter_map(|gate| match gate {
+                Gate::AND { a, b, out: _ } => Some((*a as usize, *b as usize)),
+                _ => None,
+            })
+            .collect_vec();
+        let auth_prods = self
+            .preprocessor
+            .auth_muls(&auth_bits, &indicies_for_mul)
+            .unwrap();
+
+        // garble the AND gates
+        let mut and_gate_counter = 0usize;
         for gate in circuit.gates() {
             match gate {
-                Gate::XOR { a, b, out } => {
-                    let output_share = &auth_bits[*a as usize] + &auth_bits[*b as usize];
-                    assert!(auth_bits[*out as usize].is_empty());
-                    auth_bits[*out as usize] = output_share;
-                    if self.is_garbler() {
-                        wire_labels[*out as usize] =
-                            wire_labels[*a as usize] + wire_labels[*b as usize];
-                    }
-                }
-                Gate::INV { a, out } => {
-                    if self.is_garbler() {
-                        wire_labels[*out as usize] = wire_labels[*a as usize] + self.delta;
-                    }
-                    auth_bits[*out as usize] = auth_bits[*a as usize].clone();
-                }
+                Gate::XOR { .. } | Gate::INV { .. } => { /* already processed */ }
                 Gate::AND { a, b, out } => {
                     let bit_a = &auth_bits[*a as usize];
                     let bit_b = &auth_bits[*b as usize];
                     let bit_out = &auth_bits[*out as usize];
-                    // TODO batch this auth_mul
-                    let auth_prod = self.preprocessor.auth_mul(bit_a, bit_b).unwrap();
+                    let auth_prod = &auth_prods[and_gate_counter];
 
                     // a = 0, b = 0: \lambda_a \lambda_b + \lambda_\gamma
-                    let share0 = &auth_prod + bit_out;
+                    let share0 = auth_prod + bit_out;
                     // a = 0, b = 1: \lambda_a + \lambda_a \lambda_b + \lambda_\gamma
                     let share1 = &share0 + bit_a;
                     // a = 1, b = 0: \lambda_b + \lambda_a \lambda_b + \lambda_\gamma
@@ -500,6 +512,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
                         // NOTE: this is topological order
                         eval_output.push([share0, share1, share2, share3]);
                     }
+                    and_gate_counter += 1;
                 }
                 Gate::EQ { lit: _, out: _ } => unimplemented!("EQ gate not supported"),
                 Gate::EQW { a: _, out: _ } => unimplemented!("EQW gate not supported"),

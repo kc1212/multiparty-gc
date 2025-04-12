@@ -1,4 +1,4 @@
-use bristol_fashion::Circuit;
+use bristol_fashion::{Circuit, Gate};
 use rand::{CryptoRng, Rng};
 use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
@@ -99,4 +99,34 @@ pub(crate) fn auth_bits_from_prep<P: Preprocessor>(
     }
     assert!(unindexed_auth_bits.is_empty());
     auth_bits
+}
+
+pub(crate) fn process_linear_gates(
+    auth_bits: &mut [AuthShare<F2, F128b>],
+    wire_labels: &mut [F128b],
+    circuit: &Circuit,
+    delta: F128b,
+    is_garbler: bool,
+) {
+    for gate in circuit.gates() {
+        match gate {
+            Gate::XOR { a, b, out } => {
+                let output_share = &auth_bits[*a as usize] + &auth_bits[*b as usize];
+                assert!(auth_bits[*out as usize].is_empty());
+                auth_bits[*out as usize] = output_share;
+                if is_garbler {
+                    wire_labels[*out as usize] =
+                        wire_labels[*a as usize] + wire_labels[*b as usize];
+                }
+            }
+            Gate::INV { a, out } => {
+                if is_garbler {
+                    wire_labels[*out as usize] = wire_labels[*a as usize] + delta;
+                }
+                auth_bits[*out as usize] = auth_bits[*a as usize].clone();
+            }
+            Gate::AND { .. } => { /* ignore */ }
+            unsupported_gate => unimplemented!("unsupported gate {unsupported_gate:?}"),
+        }
+    }
 }
