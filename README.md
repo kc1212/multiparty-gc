@@ -16,3 +16,5 @@ cargo flamegraph --freq 200 --bench mybench  -- --bench <benchmark_name> --profi
 
 where `<benchmark_name>` are `copz aes`, for example.
 The result will be written to `flamegraph.svg` which can be opened in Firefox.
+More performance can be achieved with
+`RUSTFLAGS="-C target-cpu=native"`.

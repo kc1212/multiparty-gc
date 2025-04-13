@@ -97,7 +97,7 @@ pub(crate) fn auth_bits_from_prep<P: Preprocessor>(
             _ => { /* do nothing */ }
         }
     }
-    assert!(unindexed_auth_bits.is_empty());
+    debug_assert!(unindexed_auth_bits.is_empty());
     auth_bits
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn process_linear_gates(
         match gate {
             Gate::XOR { a, b, out } => {
                 let output_share = &auth_bits[*a as usize] + &auth_bits[*b as usize];
-                assert!(auth_bits[*out as usize].is_empty());
+                debug_assert!(auth_bits[*out as usize].is_empty());
                 auth_bits[*out as usize] = output_share;
                 if is_garbler {
                     wire_labels[*out as usize] =

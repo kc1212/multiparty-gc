@@ -99,7 +99,7 @@ where
         // if MACs are given as a vector
         // we assume they're indexed from 0 to n-2 (length of n-1)
         let final_index = mac_values.len() as u16;
-        assert_eq!(self.party_id, final_index);
+        debug_assert_eq!(self.party_id, final_index);
         for (key, mac) in self.mac_keys.iter().zip(mac_values) {
             if *mac != (self.share * *delta) + *key {
                 return Err(GcError::MacCheckFailure);
@@ -146,7 +146,7 @@ macro_rules! impl_add {
             type Output = AuthShare<ShareFF, MacFF>;
 
             fn add(self, rhs: &AuthShare<ShareFF, MacFF>) -> Self::Output {
-                assert_eq!(self.party_id, rhs.party_id);
+                debug_assert_eq!(self.party_id, rhs.party_id);
                 let new_share = self.share + rhs.share;
                 let new_mac_values = self
                     .mac_values
@@ -186,7 +186,7 @@ where
     R: Rng + CryptoRng,
 {
     let n = deltas.len() as u16;
-    assert!(n > 0);
+    debug_assert!(n > 0);
     let mut shares = (0..n).map(|_| ShareFF::random(rng)).collect_vec();
 
     // Sum trait is not implemented, so we use fold

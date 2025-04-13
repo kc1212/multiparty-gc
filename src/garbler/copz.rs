@@ -240,9 +240,9 @@ fn encrypt_garbled_table(
     let body_1 = write_body(r1, k_v_0);
     let body_2 = write_body(r2_0, k_w_0);
     let body_3 = write_body(r2_1, k_w_0);
-    assert_eq!(body_1.get_ref().len(), mask_1.len());
-    assert_eq!(body_2.get_ref().len(), mask_2.len());
-    assert_eq!(body_3.get_ref().len(), mask_3.len());
+    debug_assert_eq!(body_1.get_ref().len(), mask_1.len());
+    debug_assert_eq!(body_2.get_ref().len(), mask_2.len());
+    debug_assert_eq!(body_3.get_ref().len(), mask_3.len());
 
     for (m, b) in mask_1.iter_mut().zip(body_1.get_ref()) {
         *m ^= *b;
@@ -274,7 +274,7 @@ pub(crate) fn decrypt_garbled_gate(
     gate_id: u64,
     num_parties: u16,
 ) -> (F2, Vec<F128b>) {
-    assert_eq!(garbled_tables.len(), num_parties as usize - 1);
+    debug_assert_eq!(garbled_tables.len(), num_parties as usize - 1);
     let out_len = (128 + (num_parties as usize - 2) * 128) / 8;
 
     let h = |k_left: &F128b, k_right: &F128b, party_id: u16| {
@@ -410,9 +410,14 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         // Get the deltas, make sure lsb(\Delta_2) = 1
         // This translates to delta of party_id = 0 since evaluator is party n-1
         self.delta = self.preprocessor.init_delta().unwrap();
-        if self.party_id == 0 {
-            assert_eq!(self.delta.to_bytes()[0] & 1, 1);
+
+        #[cfg(test)]
+        {
+            if self.party_id == 0 {
+                assert_eq!(self.delta.to_bytes()[0] & 1, 1);
+            }
         }
+
         let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
         let mut wire_labels = self.gen_labels(rng, circuit);
 
