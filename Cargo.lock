@@ -625,7 +625,6 @@ dependencies = [
  "smallvec",
  "swanky-field-binary",
  "thiserror",
- "vectoreyes",
 ]
 
 [[package]]

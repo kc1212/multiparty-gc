@@ -457,3 +457,82 @@ impl Preprocessor for InsecurePreprocessor {
         unimplemented!("unsupported")
     }
 }
+
+// The this preprocessor produces wrong values,
+// it should only be used for benchmarking the garbler.
+#[derive(Clone)]
+pub struct InsecureBenchPreprocessor {
+    party_count: u16,
+    delta: F128b,
+    dummy_auth_bits: Vec<AuthShare<F2, F128b>>,
+}
+
+impl InsecureBenchPreprocessor {
+    pub fn new<R: Rng + CryptoRng>(party_count: u16, max_auth_bits: usize, rng: &mut R) -> Self {
+        let deltas: Vec<_> = (0..party_count).map(|_| F128b::random(rng)).collect();
+        let dummy_auth_bits = (0..max_auth_bits)
+            .map(|_| secret_share_with_delta(F2::ZERO, &deltas, rng)[0].clone())
+            .collect();
+        Self {
+            party_count,
+            delta: deltas[0],
+            dummy_auth_bits,
+        }
+    }
+}
+
+impl StaticPreprocessor for InsecureBenchPreprocessor {
+    fn party_count(&self) -> u16 {
+        self.party_count
+    }
+
+    fn init_delta(&mut self) -> Result<F128b, GcError> {
+        Ok(self.delta)
+    }
+
+    fn auth_bits(&mut self, m: u64) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
+        Ok(self.dummy_auth_bits[..m as usize].to_vec())
+    }
+
+    fn auth_mul(
+        &mut self,
+        _x: &AuthShare<F2, F128b>,
+        _y: &AuthShare<F2, F128b>,
+    ) -> Result<AuthShare<F2, F128b>, GcError> {
+        Ok(self.dummy_auth_bits[0].clone())
+    }
+
+    fn auth_muls(
+        &mut self,
+        _shares: &[AuthShare<F2, F128b>],
+        indices: &[(usize, usize)],
+    ) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
+        Ok(self.dummy_auth_bits[..indices.len()].to_vec())
+    }
+
+    fn and_output_mask(
+        &mut self,
+        _x: &AuthShare<F2, F128b>,
+        _y: &AuthShare<F2, F128b>,
+    ) -> Result<Vec<F128b>, GcError> {
+        todo!()
+    }
+
+    fn open_values_to(
+        &mut self,
+        _party_id: u16,
+        _xs: &[AuthShare<F2, F128b>],
+    ) -> Result<Option<Vec<F2>>, GcError> {
+        todo!()
+    }
+
+    fn done(&mut self) {
+        // do nothing
+    }
+}
+
+impl Preprocessor for InsecureBenchPreprocessor {
+    fn prep(&mut self) {
+        todo!()
+    }
+}
