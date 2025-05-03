@@ -464,7 +464,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
             .collect_vec();
         let auth_prods = self
             .preprocessor
-            .auth_muls(&auth_bits, &indicies_for_mul)
+            .beaver_mul(&auth_bits, &indicies_for_mul)
             .unwrap();
 
         let mut and_gate_counter = 0usize;

@@ -3,6 +3,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 
 use itertools::Itertools;
+use itertools::izip;
 use rand::CryptoRng;
 use rand::Rng;
 use scuttlebutt::ring::FiniteRing;
@@ -16,6 +17,17 @@ use crate::sharing::secret_share_with_delta;
 use crate::sharing::verify_and_reconstruct;
 use crate::transpose;
 
+pub type Triple = (
+    AuthShare<F2, F128b>,
+    AuthShare<F2, F128b>,
+    AuthShare<F2, F128b>,
+);
+
+// pub enum ReceiverParty {
+//     All,
+//     Party(u16)
+// }
+
 /// Static preprocessor is one that has no networking.
 ///
 /// Authenticated shares are only consistent
@@ -23,25 +35,57 @@ use crate::transpose;
 /// by all parties.
 pub trait StaticPreprocessor {
     fn party_count(&self) -> u16;
+    fn my_party_id(&self) -> u16;
     fn init_delta(&mut self) -> Result<F128b, GcError>;
     fn auth_bits(&mut self, m: u64) -> Result<Vec<AuthShare<F2, F128b>>, GcError>;
-    fn auth_mul(
-        &mut self,
-        x: &AuthShare<F2, F128b>,
-        y: &AuthShare<F2, F128b>,
-    ) -> Result<AuthShare<F2, F128b>, GcError>;
 
-    fn auth_muls(
+    fn beaver_triples(&mut self, m: u64) -> Result<Vec<Triple>, GcError>;
+
+    /// Perform a beaver multiplication using beaver triples from [auth_triples].
+    fn beaver_mul(
         &mut self,
         shares: &[AuthShare<F2, F128b>],
         indices: &[(usize, usize)],
     ) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
-        // default implementation
-        let mut out = Vec::with_capacity(indices.len());
-        for (i, j) in indices {
-            out.push(self.auth_mul(&shares[*i], &shares[*j])?);
-        }
-        Ok(out)
+        // [x], [y] is the input
+        // take two random bits [a], [b]
+        let beaver_triples = self.beaver_triples(indices.len() as u64)?;
+        // d = Open([x + a]), e = Open([y + b])
+        let (shares_d, shares_e): (Vec<_>, Vec<_>) = izip!(indices, &beaver_triples)
+            .map(|((i, j), (a, b, _c))| {
+                let unopened_d = &shares[*i] + a;
+                let unopened_e = &shares[*j] + b;
+                (unopened_d, unopened_e)
+            })
+            .unzip();
+
+        let party_count = self.party_count();
+
+        // TODO: find a way to avoid the double collect here
+        let ds = (0..party_count)
+            .map(|party_id| self.open_values_to(party_id, &shares_d))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        let es = (0..party_count)
+            .map(|party_id| self.open_values_to(party_id, &shares_e))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        // z = d * [y] + [a] * e + [c]
+        Ok(izip!(indices, ds, es, beaver_triples)
+            .map(|((_idx_x, idx_y), d, e, beaver_triple)| {
+                let share_y = &shares[*idx_y];
+                let (share_a, _, share_c) = beaver_triple;
+                share_y * d + &(share_a * e) + &share_c
+            })
+            .collect_vec())
     }
 
     /// Compute z = x*y and then output unauthenticated shares <x * \Delta^i>
@@ -72,9 +116,8 @@ pub trait Preprocessor: StaticPreprocessor {
 enum InsecurePreprocessorReq {
     Delta(u16),
     Bits(u16, u64),
-    AuthMul(u16, (AuthShare<F2, F128b>, AuthShare<F2, F128b>)),
-    AuthMuls(u16, Vec<(AuthShare<F2, F128b>, AuthShare<F2, F128b>)>),
-    OpenValuesTo(u16, Vec<AuthShare<F2, F128b>>),
+    BeaverTriples(u16, u64),
+    OpenValuesTo(u16, u16, Vec<AuthShare<F2, F128b>>),
     Done(u16),
 }
 
@@ -83,9 +126,8 @@ impl InsecurePreprocessorReq {
         *match self {
             InsecurePreprocessorReq::Delta(pid) => pid,
             InsecurePreprocessorReq::Bits(pid, _) => pid,
-            InsecurePreprocessorReq::AuthMul(pid, (_, _)) => pid,
-            InsecurePreprocessorReq::AuthMuls(pid, _) => pid,
-            InsecurePreprocessorReq::OpenValuesTo(pid, _) => pid,
+            InsecurePreprocessorReq::BeaverTriples(pid, _) => pid,
+            InsecurePreprocessorReq::OpenValuesTo(pid, _, _) => pid,
             InsecurePreprocessorReq::Done(pid) => pid,
         }
     }
@@ -104,25 +146,16 @@ impl InsecurePreprocessorReq {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn take_auth_mul(self) -> Result<(AuthShare<F2, F128b>, AuthShare<F2, F128b>), GcError> {
+    fn take_beaver_triples(self) -> Result<u64, GcError> {
         match self {
-            InsecurePreprocessorReq::AuthMul(_, t) => Ok(t),
+            InsecurePreprocessorReq::BeaverTriples(_, x) => Ok(x),
             _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn take_auth_muls(self) -> Result<Vec<(AuthShare<F2, F128b>, AuthShare<F2, F128b>)>, GcError> {
+    fn take_open_values_to(self) -> Result<(u16, Vec<AuthShare<F2, F128b>>), GcError> {
         match self {
-            InsecurePreprocessorReq::AuthMuls(_, t) => Ok(t),
-            _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
-        }
-    }
-
-    fn take_open_values_to(self) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
-        match self {
-            InsecurePreprocessorReq::OpenValuesTo(_, values) => Ok(values),
+            InsecurePreprocessorReq::OpenValuesTo(_, receiver, values) => Ok((receiver, values)),
             _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
         }
     }
@@ -139,9 +172,8 @@ impl InsecurePreprocessorReq {
 enum InsecurePreprocessorResp {
     Delta(F128b),
     Bits(Vec<AuthShare<F2, F128b>>),
-    AuthMul(AuthShare<F2, F128b>),
-    AuthMuls(Vec<AuthShare<F2, F128b>>),
-    OpenValuesTo(Vec<F2>),
+    BeaverTriples(Vec<Triple>),
+    OpenValuesTo(Option<Vec<F2>>),
 }
 
 impl InsecurePreprocessorResp {
@@ -159,21 +191,14 @@ impl InsecurePreprocessorResp {
         }
     }
 
-    fn expect_auth_mul(self) -> Result<AuthShare<F2, F128b>, GcError> {
+    fn expect_beaver_triples(self) -> Result<Vec<Triple>, GcError> {
         match self {
-            InsecurePreprocessorResp::AuthMul(x) => Ok(x),
+            InsecurePreprocessorResp::BeaverTriples(x) => Ok(x),
             _ => Err(GcError::UnexpectedMessageType("in resopnse".to_string())),
         }
     }
 
-    fn expect_auth_mults(self) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
-        match self {
-            InsecurePreprocessorResp::AuthMuls(x) => Ok(x),
-            _ => Err(GcError::UnexpectedMessageType("in resopnse".to_string())),
-        }
-    }
-
-    fn expect_open_values_to(self) -> Result<Vec<F2>, GcError> {
+    fn expect_open_values_to(self) -> Result<Option<Vec<F2>>, GcError> {
         match self {
             InsecurePreprocessorResp::OpenValuesTo(x) => Ok(x),
             _ => Err(GcError::UnexpectedMessageType("in resopnse".to_string())),
@@ -260,58 +285,43 @@ impl InsecurePreprocessorRunner {
                         ch.send(InsecurePreprocessorResp::Bits(share))?;
                     }
                 }
-                InsecurePreprocessorReq::AuthMul(..) => {
+                InsecurePreprocessorReq::BeaverTriples(..) => {
                     let reqs = batch
                         .into_iter()
-                        .map(|x| x.take_auth_mul())
+                        .map(|x| x.take_beaver_triples())
                         .collect::<Result<Vec<_>, _>>()?;
+                    let n = *elements_all_equal(&reqs).ok_or(GcError::NotAllEqual)?;
 
-                    // sum the as and bs
-                    let (bits_a, bits_b) = reqs.into_iter().unzip();
-                    let a = verify_and_reconstruct(party_count as u16, bits_a, &deltas).unwrap();
-                    let b = verify_and_reconstruct(party_count as u16, bits_b, &deltas).unwrap();
-
-                    let prod = a * b;
-
-                    let prod_shares = secret_share_with_delta(prod, &deltas, rng);
-                    for (ch, share) in self.send_chans.iter().zip(prod_shares) {
-                        ch.send(InsecurePreprocessorResp::AuthMul(share))?;
-                    }
-                }
-                InsecurePreprocessorReq::AuthMuls(..) => {
-                    // reqs are indexed by parties
-                    let reqs = batch
-                        .into_iter()
-                        .map(|x| x.take_auth_muls())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    // transpose the requests so that they're indexed by the element in the batch
-                    let reqs = transpose(reqs);
-                    let result = transpose(
-                        reqs.into_iter()
-                            .map(|req| {
-                                let (bits_a, bits_b) = req.into_iter().unzip();
-                                let a = verify_and_reconstruct(party_count as u16, bits_a, &deltas)
-                                    .unwrap();
-                                let b = verify_and_reconstruct(party_count as u16, bits_b, &deltas)
-                                    .unwrap();
-                                let prod = a * b;
-                                secret_share_with_delta(prod, &deltas, rng)
+                    let triples = transpose(
+                        (0..n)
+                            .map(|_| {
+                                let a = F2::random(rng);
+                                let b = F2::random(rng);
+                                let c = a * b;
+                                let auth_a = secret_share_with_delta(a, &deltas, rng);
+                                let auth_b = secret_share_with_delta(b, &deltas, rng);
+                                let auth_c = secret_share_with_delta(c, &deltas, rng);
+                                izip!(auth_a, auth_b, auth_c)
+                                    .map(|(a, b, c)| (a, b, c))
+                                    .collect_vec()
                             })
-                            .collect(),
+                            .collect_vec(),
                     );
-                    debug_assert_eq!(result.len(), self.send_chans.len());
-                    for (ch, share) in self.send_chans.iter().zip(result) {
-                        ch.send(InsecurePreprocessorResp::AuthMuls(share))?;
+
+                    debug_assert_eq!(triples.len(), self.send_chans.len());
+
+                    for (ch, share) in self.send_chans.iter().zip(triples) {
+                        ch.send(InsecurePreprocessorResp::BeaverTriples(share))?;
                     }
                 }
                 InsecurePreprocessorReq::OpenValuesTo(..) => {
-                    let receivers = batch.iter().map(|x| x.get_party_id()).collect_vec();
-                    let receiver = *elements_all_equal(&receivers).ok_or(GcError::NotAllEqual)?;
-
-                    let reqs = batch
+                    let (receivers, reqs): (Vec<u16>, _) = batch
                         .into_iter()
                         .map(|x| x.take_open_values_to())
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .unzip();
+                    let receiver = *elements_all_equal(&receivers).ok_or(GcError::NotAllEqual)?;
 
                     let reqs = transpose(reqs);
 
@@ -319,8 +329,15 @@ impl InsecurePreprocessorRunner {
                         .into_iter()
                         .map(|req| verify_and_reconstruct(party_count as u16, req, &deltas))
                         .collect::<Result<Vec<_>, GcError>>()?;
+
                     self.send_chans[receiver as usize]
-                        .send(InsecurePreprocessorResp::OpenValuesTo(res))?;
+                        .send(InsecurePreprocessorResp::OpenValuesTo(Some(res)))?;
+
+                    for (i, ch) in self.send_chans.iter().enumerate() {
+                        if receiver as usize != i {
+                            ch.send(InsecurePreprocessorResp::OpenValuesTo(None))?;
+                        }
+                    }
                 }
                 InsecurePreprocessorReq::Done(_) => {
                     let _out = batch
@@ -346,6 +363,10 @@ pub struct InsecurePreprocessor {
 }
 
 impl StaticPreprocessor for InsecurePreprocessor {
+    fn my_party_id(&self) -> u16 {
+        self.party_id
+    }
+
     fn party_count(&self) -> u16 {
         self.party_count
     }
@@ -364,34 +385,11 @@ impl StaticPreprocessor for InsecurePreprocessor {
         res.expect_bits()
     }
 
-    fn auth_mul(
-        &mut self,
-        x: &AuthShare<F2, F128b>,
-        y: &AuthShare<F2, F128b>,
-    ) -> Result<AuthShare<F2, F128b>, GcError> {
-        self.send_chan.send(InsecurePreprocessorReq::AuthMul(
-            self.party_id,
-            (x.clone(), y.clone()),
-        ))?;
-        let res = self.recv_chan.recv()?;
-        res.expect_auth_mul()
-    }
-
-    fn auth_muls(
-        &mut self,
-        shares: &[AuthShare<F2, F128b>],
-        indices: &[(usize, usize)],
-    ) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
-        let query = indices
-            .iter()
-            .map(|(a, b)| (shares[*a].clone(), shares[*b].clone()))
-            .collect();
-
+    fn beaver_triples(&mut self, m: u64) -> Result<Vec<Triple>, GcError> {
         self.send_chan
-            .send(InsecurePreprocessorReq::AuthMuls(self.party_id, query))?;
-
+            .send(InsecurePreprocessorReq::BeaverTriples(self.party_id, m))?;
         let res = self.recv_chan.recv()?;
-        res.expect_auth_mults()
+        res.expect_beaver_triples()
     }
 
     fn and_output_mask(
@@ -407,13 +405,17 @@ impl StaticPreprocessor for InsecurePreprocessor {
         party_id: u16,
         xs: &[AuthShare<F2, F128b>],
     ) -> Result<Option<Vec<F2>>, GcError> {
-        self.send_chan
-            .send(InsecurePreprocessorReq::OpenValuesTo(party_id, xs.to_vec()))?;
-        if self.party_id == party_id {
-            let res = self.recv_chan.recv()?;
-            Ok(Some(res.expect_open_values_to()?))
-        } else {
-            Ok(None)
+        self.send_chan.send(InsecurePreprocessorReq::OpenValuesTo(
+            self.party_id,
+            party_id,
+            xs.to_vec(),
+        ))?;
+        let res = self.recv_chan.recv()?.expect_open_values_to()?;
+        match (self.party_id == party_id, res) {
+            (true, Some(inner)) => Ok(Some(inner)),
+            (true, None) => Err(GcError::WrongOpening),
+            (false, Some(_)) => Err(GcError::WrongOpening),
+            (false, None) => Ok(None),
         }
     }
 
@@ -482,6 +484,19 @@ impl InsecureBenchPreprocessor {
 }
 
 impl StaticPreprocessor for InsecureBenchPreprocessor {
+    fn my_party_id(&self) -> u16 {
+        // the party ID here doesn't matter
+        // since only one party is garbling
+        1
+    }
+
+    fn beaver_triples(&mut self, m: u64) -> Result<Vec<Triple>, GcError> {
+        let m_auth_bits = self.dummy_auth_bits[0..m as usize].to_vec();
+        Ok(izip!(m_auth_bits.clone(), m_auth_bits.clone(), m_auth_bits)
+            .map(|(a, b, c)| (a, b, c))
+            .collect())
+    }
+
     fn party_count(&self) -> u16 {
         self.party_count
     }
@@ -494,22 +509,6 @@ impl StaticPreprocessor for InsecureBenchPreprocessor {
         Ok(self.dummy_auth_bits[..m as usize].to_vec())
     }
 
-    fn auth_mul(
-        &mut self,
-        _x: &AuthShare<F2, F128b>,
-        _y: &AuthShare<F2, F128b>,
-    ) -> Result<AuthShare<F2, F128b>, GcError> {
-        Ok(self.dummy_auth_bits[0].clone())
-    }
-
-    fn auth_muls(
-        &mut self,
-        _shares: &[AuthShare<F2, F128b>],
-        indices: &[(usize, usize)],
-    ) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
-        Ok(self.dummy_auth_bits[..indices.len()].to_vec())
-    }
-
     fn and_output_mask(
         &mut self,
         _x: &AuthShare<F2, F128b>,
@@ -520,10 +519,14 @@ impl StaticPreprocessor for InsecureBenchPreprocessor {
 
     fn open_values_to(
         &mut self,
-        _party_id: u16,
-        _xs: &[AuthShare<F2, F128b>],
+        party_id: u16,
+        xs: &[AuthShare<F2, F128b>],
     ) -> Result<Option<Vec<F2>>, GcError> {
-        todo!()
+        if party_id == self.my_party_id() {
+            Ok(Some(vec![F2::ZERO; xs.len()]))
+        } else {
+            Ok(None)
+        }
     }
 
     fn done(&mut self) {

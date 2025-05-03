@@ -8,7 +8,7 @@ use scuttlebutt::{
 use smallvec::smallvec;
 use std::{
     io::{Read, Write},
-    ops::Add,
+    ops::{Add, Mul},
 };
 
 use crate::error::GcError;
@@ -171,8 +171,34 @@ macro_rules! impl_add {
     };
 }
 
+macro_rules! impl_const_mul {
+    ($for_type:ty) => {
+        impl<ShareFF, MacFF> Mul<ShareFF> for $for_type
+        where
+            ShareFF: FiniteField + IsSubFieldOf<MacFF>,
+            MacFF: FiniteField,
+        {
+            type Output = AuthShare<ShareFF, MacFF>;
+
+            fn mul(self, rhs: ShareFF) -> Self::Output {
+                let new_share = self.share * rhs;
+                let new_mac_values = self.mac_values.iter().map(|left| rhs * *left).collect();
+                let new_mac_keys = self.mac_keys.iter().map(|left| rhs * *left).collect();
+                Self::Output {
+                    party_id: self.party_id,
+                    share: new_share,
+                    mac_values: new_mac_values,
+                    mac_keys: new_mac_keys,
+                }
+            }
+        }
+    };
+}
+
 impl_add!(AuthShare<ShareFF, MacFF>);
 impl_add!(&AuthShare<ShareFF, MacFF>);
+impl_const_mul!(AuthShare<ShareFF, MacFF>);
+impl_const_mul!(&AuthShare<ShareFF, MacFF>);
 
 pub fn secret_share_with_delta<ShareFF, MacFF, R>(
     secret: ShareFF,
@@ -260,6 +286,9 @@ where
     MacFF: FiniteField,
     ShareFF: IsSubFieldOf<MacFF>,
 {
+    // assume there are as many shares as [n]
+    debug_assert_eq!(n as usize, shares.len());
+
     // we need to check, for every shares x^i such that
     // M_j[x^i] = x^i \Delta_j + K_j[x^i], for j in [n] \ i
     // held by i                 held by j
@@ -355,5 +384,19 @@ mod test {
 
             assert_eq!(actual, expected)
         }
+    }
+
+    #[test]
+    fn test_mul_by_const() {
+        let mut rng = AesRng::new();
+        let n = 10u16;
+        let constant = F2::random(&mut rng);
+        let secret = F2::random(&mut rng);
+        let (shares, deltas) = secret_share::<_, F128b, _>(secret, n, &mut rng);
+        let shares = shares.into_iter().map(|share| share * constant).collect();
+        assert_eq!(
+            secret * constant,
+            verify_and_reconstruct(n, shares, &deltas).unwrap()
+        );
     }
 }

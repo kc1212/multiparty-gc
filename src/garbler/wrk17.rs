@@ -428,7 +428,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
             .collect_vec();
         let auth_prods = self
             .preprocessor
-            .auth_muls(&auth_bits, &indicies_for_mul)
+            .beaver_mul(&auth_bits, &indicies_for_mul)
             .unwrap();
 
         // garble the AND gates

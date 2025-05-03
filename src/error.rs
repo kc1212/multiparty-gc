@@ -22,6 +22,8 @@ pub enum GcError {
     InputRound2CheckFailure,
     #[error("Output check failure {0}")]
     OutputCheckFailure(String),
+    #[error("Wrong party received opening")]
+    WrongOpening,
 }
 
 impl<T> From<SendError<T>> for GcError {
