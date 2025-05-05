@@ -21,7 +21,6 @@ macro_rules! bench_full_aes {
         let input_length: u64 = circuit.input_sizes().iter().sum();
         let true_inputs = vec![F2::ZERO; input_length as usize];
 
-        // shutdown
         $c.bench_function($bench_name, |b| {
             let true_inputs = true_inputs.clone();
             b.iter(|| {

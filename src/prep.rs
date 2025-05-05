@@ -23,10 +23,11 @@ pub type Triple = (
     AuthShare<F2, F128b>,
 );
 
-// pub enum ReceiverParty {
-//     All,
-//     Party(u16)
-// }
+#[derive(Clone, Copy, PartialEq)]
+pub enum ReceiverParty {
+    All,
+    Party(u16),
+}
 
 /// Static preprocessor is one that has no networking.
 ///
@@ -59,24 +60,8 @@ pub trait StaticPreprocessor {
             })
             .unzip();
 
-        let party_count = self.party_count();
-
-        // TODO: find a way to avoid the double collect here
-        let ds = (0..party_count)
-            .map(|party_id| self.open_values_to(party_id, &shares_d))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let es = (0..party_count)
-            .map(|party_id| self.open_values_to(party_id, &shares_e))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect::<Vec<_>>();
+        let ds = self.open_values_to(ReceiverParty::All, &shares_d)?.unwrap();
+        let es = self.open_values_to(ReceiverParty::All, &shares_e)?.unwrap();
 
         // z = d * [y] + [a] * e + [c]
         Ok(izip!(indices, ds, es, beaver_triples)
@@ -99,7 +84,7 @@ pub trait StaticPreprocessor {
     /// Returns None if the caller does not have ID `party_id`, otherwise return the opened values.
     fn open_values_to(
         &mut self,
-        party_id: u16,
+        receiver_party: ReceiverParty,
         xs: &[AuthShare<F2, F128b>],
     ) -> Result<Option<Vec<F2>>, GcError>;
 
@@ -117,7 +102,7 @@ enum InsecurePreprocessorReq {
     Delta(u16),
     Bits(u16, u64),
     BeaverTriples(u16, u64),
-    OpenValuesTo(u16, u16, Vec<AuthShare<F2, F128b>>),
+    OpenValuesTo(u16, ReceiverParty, Vec<AuthShare<F2, F128b>>),
     Done(u16),
 }
 
@@ -153,7 +138,7 @@ impl InsecurePreprocessorReq {
         }
     }
 
-    fn take_open_values_to(self) -> Result<(u16, Vec<AuthShare<F2, F128b>>), GcError> {
+    fn take_open_values_to(self) -> Result<(ReceiverParty, Vec<AuthShare<F2, F128b>>), GcError> {
         match self {
             InsecurePreprocessorReq::OpenValuesTo(_, receiver, values) => Ok((receiver, values)),
             _ => Err(GcError::UnexpectedMessageType("in request".to_string())),
@@ -315,7 +300,7 @@ impl InsecurePreprocessorRunner {
                     }
                 }
                 InsecurePreprocessorReq::OpenValuesTo(..) => {
-                    let (receivers, reqs): (Vec<u16>, _) = batch
+                    let (receivers, reqs): (Vec<ReceiverParty>, _) = batch
                         .into_iter()
                         .map(|x| x.take_open_values_to())
                         .collect::<Result<Vec<_>, _>>()?
@@ -330,12 +315,20 @@ impl InsecurePreprocessorRunner {
                         .map(|req| verify_and_reconstruct(party_count as u16, req, &deltas))
                         .collect::<Result<Vec<_>, GcError>>()?;
 
-                    self.send_chans[receiver as usize]
-                        .send(InsecurePreprocessorResp::OpenValuesTo(Some(res)))?;
-
-                    for (i, ch) in self.send_chans.iter().enumerate() {
-                        if receiver as usize != i {
-                            ch.send(InsecurePreprocessorResp::OpenValuesTo(None))?;
+                    match receiver {
+                        ReceiverParty::All => {
+                            for ch in self.send_chans.iter() {
+                                ch.send(InsecurePreprocessorResp::OpenValuesTo(Some(res.clone())))?;
+                            }
+                        }
+                        ReceiverParty::Party(receiver_id) => {
+                            self.send_chans[receiver_id as usize]
+                                .send(InsecurePreprocessorResp::OpenValuesTo(Some(res)))?;
+                            for (i, ch) in self.send_chans.iter().enumerate() {
+                                if receiver_id as usize != i {
+                                    ch.send(InsecurePreprocessorResp::OpenValuesTo(None))?;
+                                }
+                            }
                         }
                     }
                 }
@@ -402,20 +395,35 @@ impl StaticPreprocessor for InsecurePreprocessor {
 
     fn open_values_to(
         &mut self,
-        party_id: u16,
+        receiver_party: ReceiverParty,
         xs: &[AuthShare<F2, F128b>],
     ) -> Result<Option<Vec<F2>>, GcError> {
         self.send_chan.send(InsecurePreprocessorReq::OpenValuesTo(
             self.party_id,
-            party_id,
+            receiver_party,
             xs.to_vec(),
         ))?;
         let res = self.recv_chan.recv()?.expect_open_values_to()?;
-        match (self.party_id == party_id, res) {
-            (true, Some(inner)) => Ok(Some(inner)),
-            (true, None) => Err(GcError::WrongOpening),
-            (false, Some(_)) => Err(GcError::WrongOpening),
-            (false, None) => Ok(None),
+        match receiver_party {
+            ReceiverParty::All => {
+                if res.is_none() {
+                    Err(GcError::WrongOpening(
+                        "empty result when opening to all".to_string(),
+                    ))
+                } else {
+                    Ok(res)
+                }
+            }
+            ReceiverParty::Party(receiver_id) => match (self.party_id == receiver_id, res) {
+                (true, Some(inner)) => Ok(Some(inner)),
+                (true, None) => Err(GcError::WrongOpening(
+                    "empty result when opening to a party".to_string(),
+                )),
+                (false, Some(_)) => Err(GcError::WrongOpening(
+                    "unexpected message in opening".to_string(),
+                )),
+                (false, None) => Ok(None),
+            },
         }
     }
 
@@ -519,13 +527,18 @@ impl StaticPreprocessor for InsecureBenchPreprocessor {
 
     fn open_values_to(
         &mut self,
-        party_id: u16,
+        receiver_party: ReceiverParty,
         xs: &[AuthShare<F2, F128b>],
     ) -> Result<Option<Vec<F2>>, GcError> {
-        if party_id == self.my_party_id() {
-            Ok(Some(vec![F2::ZERO; xs.len()]))
-        } else {
-            Ok(None)
+        match receiver_party {
+            ReceiverParty::All => Ok(Some(vec![F2::ZERO; xs.len()])),
+            ReceiverParty::Party(party_id) => {
+                if party_id == self.my_party_id() {
+                    Ok(Some(vec![F2::ZERO; xs.len()]))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 
