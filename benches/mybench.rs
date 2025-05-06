@@ -21,21 +21,30 @@ macro_rules! bench_full_aes {
         let input_length: u64 = circuit.input_sizes().iter().sum();
         let true_inputs = vec![F2::ZERO; input_length as usize];
 
+        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
+        let triples = circuit.nand() as usize;
+        let bits = (circuit.nand() + input_wire_count) as usize;
+
         $c.bench_function($bench_name, |b| {
             let true_inputs = true_inputs.clone();
             b.iter(|| {
-                let (preps, runner) = InsecurePreprocessor::new(num_parties, true);
-                let prep_handler = std::thread::spawn(move || {
-                    let mut rng = AesRng::new();
-                    runner.run_blocking(&mut rng).unwrap()
-                });
+                let mut rng = AesRng::new();
+                let (preps, runner) =
+                    InsecurePreprocessor::new(&mut rng, num_parties, true, bits, triples);
+                let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
                 let garblers = preps
                     .into_iter()
                     .enumerate()
                     .map(|(party_id, prep)| <$garbler>::new(party_id as u16, num_parties, prep))
                     .collect_vec();
-                full_simulation::<_, $evaluator, _>(garblers, &circuit, true_inputs.clone(), false);
+                let _ = full_simulation::<_, $evaluator, _>(
+                    garblers,
+                    &circuit,
+                    true_inputs.clone(),
+                    false,
+                    Some($bench_name.to_string()),
+                );
 
                 prep_handler.join().unwrap()
             })

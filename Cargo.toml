@@ -13,6 +13,8 @@ thiserror = "2.0.11"
 blake3 = "1.6.1"
 generic-array = "1.1.1"
 smallvec = "1.15.0"
+clap = { version = "4.5.37", features = ["derive"] }
+# serde = { version = "1.0.219", features = ["derive"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

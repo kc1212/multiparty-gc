@@ -1,4 +1,7 @@
-use std::io::Read;
+use std::{
+    io::Read,
+    time::{Duration, Instant},
+};
 
 use bristol_fashion::Circuit;
 use evaluator::Evaluator;
@@ -110,10 +113,11 @@ pub fn simulate_until_eval<
     garblers: &mut Vec<G>,
     circuit: &Circuit,
     true_inputs: &[F2],
-) -> EvaluationMaterial<E>
+) -> (EvaluationMaterial<E>, Duration)
 where
     <G as Garbler>::Gc: Send,
 {
+    let start = Instant::now();
     // We use scoped threads so that we can borrow non-static data and
     // garble in parallel.
     let mut gcs = std::thread::scope(|s| {
@@ -161,13 +165,16 @@ where
 
     let evaluator = E::from_garbling(evaluator_gc);
 
-    EvaluationMaterial {
-        evaluator,
-        gcs,
-        masked_inputs,
-        input_labels: msgs_round3,
-        decoder,
-    }
+    (
+        EvaluationMaterial {
+            evaluator,
+            gcs,
+            masked_inputs,
+            input_labels: msgs_round3,
+            decoder,
+        },
+        start.elapsed(),
+    )
 }
 
 pub fn simulate_eval_and_decode<
@@ -187,9 +194,11 @@ pub fn simulate_eval_and_decode<
     true_inputs: Vec<F2>,
     eval_material: EvaluationMaterial<E>,
     check_output: bool,
-) where
+) -> Duration
+where
     <G as Garbler>::Gc: Send,
 {
+    let start = Instant::now();
     let EvaluationMaterial::<E> {
         evaluator,
         gcs,
@@ -225,6 +234,8 @@ pub fn simulate_eval_and_decode<
         .check_and_decode(output_msgs2, &chi, encoded_output, decoder, circuit)
         .unwrap();
 
+    let elapsed = start.elapsed();
+
     if check_output {
         let plain_eval_inputs = true_inputs
             .iter()
@@ -235,8 +246,10 @@ pub fn simulate_eval_and_decode<
             .map(|x| F2::from_bytes(&[x].into()).unwrap())
             .collect_vec();
 
-        assert_eq!(final_result, expected_result)
+        assert_eq!(final_result, expected_result);
     }
+
+    elapsed
 }
 
 pub fn full_simulation<
@@ -255,13 +268,60 @@ pub fn full_simulation<
     circuit: &Circuit,
     true_inputs: Vec<F2>,
     check_output: bool,
-) where
+    benchmark_tag: Option<String>,
+) -> BenchmarkReport
+where
     <G as Garbler>::Gc: Send,
 {
-    let eval_material: EvaluationMaterial<E> =
+    let party_count = garblers.len();
+    let input_count = true_inputs.len();
+    let (eval_material, garbling_duration): (EvaluationMaterial<E>, Duration) =
         simulate_until_eval(&mut garblers, circuit, &true_inputs);
 
-    simulate_eval_and_decode(garblers, circuit, true_inputs, eval_material, check_output);
+    let evaluation_duration =
+        simulate_eval_and_decode(garblers, circuit, true_inputs, eval_material, check_output);
+
+    BenchmarkReport {
+        garbling_duration,
+        evaluation_duration,
+        party_count,
+        input_count,
+        benchmark_tag,
+    }
+}
+
+pub struct BenchmarkReport {
+    garbling_duration: Duration,
+    evaluation_duration: Duration,
+    party_count: usize,
+    input_count: usize,
+    benchmark_tag: Option<String>,
+}
+
+impl BenchmarkReport {
+    pub fn total_duration(&self) -> Duration {
+        self.garbling_duration + self.evaluation_duration
+    }
+
+    pub fn csv_header() -> String {
+        "garbling_duration,evaluation_duration,total_duration,party_count,input_count,tag"
+            .to_string()
+    }
+
+    pub fn csv(&self) -> String {
+        format!(
+            "{},{},{},{},{},{}",
+            self.garbling_duration.as_millis(),
+            self.evaluation_duration.as_millis(),
+            self.total_duration().as_millis(),
+            self.party_count,
+            self.input_count,
+            match &self.benchmark_tag {
+                Some(tag) => tag,
+                None => "-",
+            },
+        )
+    }
 }
 
 fn eval_clear_circuit(circuit: &Circuit, inputs: Vec<u8>) -> Vec<u8> {
@@ -318,12 +378,20 @@ mod test {
     }
 
     fn run_wrk17_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
+        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
+        let triples = circuit.nand();
+        let bits = circuit.nand() + input_wire_count;
+
         // prepare preprocessor
-        let (preps, runner) = InsecurePreprocessor::new(num_parties, false);
-        let prep_handler = std::thread::spawn(move || {
-            let mut rng = AesRng::new();
-            runner.run_blocking(&mut rng).unwrap()
-        });
+        let mut rng = AesRng::new();
+        let (preps, runner) = InsecurePreprocessor::new(
+            &mut rng,
+            num_parties,
+            false,
+            bits as usize,
+            triples as usize,
+        );
+        let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
         let garblers = preps
             .into_iter()
@@ -331,19 +399,22 @@ mod test {
             .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true);
+        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true, None);
 
         // shutdown
         prep_handler.join().unwrap();
     }
 
     fn run_copz_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
+        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
+        let triples = circuit.nand();
+        let bits = circuit.nand() + input_wire_count;
+
         // prepare preprocessor
-        let (preps, runner) = InsecurePreprocessor::new(num_parties, true);
-        let prep_handler = std::thread::spawn(move || {
-            let mut rng = AesRng::new();
-            runner.run_blocking(&mut rng).unwrap()
-        });
+        let mut rng = AesRng::new();
+        let (preps, runner) =
+            InsecurePreprocessor::new(&mut rng, num_parties, true, bits as usize, triples as usize);
+        let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
         let garblers = preps
             .into_iter()
@@ -351,7 +422,7 @@ mod test {
             .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true);
+        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true, None);
 
         // shutdown
         prep_handler.join().unwrap();
