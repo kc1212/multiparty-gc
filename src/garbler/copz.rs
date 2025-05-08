@@ -93,14 +93,14 @@ pub enum CopzGarbling {
 impl Garbling for CopzGarbling {}
 
 impl CopzGarbling {
-    pub fn get_garbler_gates(self) -> Vec<CopzGarbledGate> {
+    pub fn into_garbler_gates(self) -> Vec<CopzGarbledGate> {
         match self {
             CopzGarbling::Garbler(inner) => inner.0,
             CopzGarbling::Evaluator(_) => panic!("not a garbler"),
         }
     }
 
-    pub fn get_evaluator_gates(self) -> CopzEvaluatorOutput {
+    pub fn into_evaluator_gates(self) -> CopzEvaluatorOutput {
         match self {
             CopzGarbling::Garbler(_) => panic!("not an evaluator"),
             CopzGarbling::Evaluator(inner) => inner,
@@ -596,7 +596,6 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         let mut output = true_inputs.to_vec();
         for CopzInputMsg1 { shares } in msgs.into_iter() {
             debug_assert_eq!(output.len(), shares.len());
-            // TODO no MAC check here?
             for (w, share) in shares.into_iter().enumerate() {
                 output[w] += share;
             }

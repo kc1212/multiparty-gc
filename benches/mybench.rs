@@ -3,6 +3,7 @@ use std::io::BufReader;
 use criterion::{Criterion, criterion_group, criterion_main};
 use itertools::Itertools;
 use multiparty_gc::{
+    NamedCircuit,
     evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
     full_simulation,
     garbler::{Garbler, copz::CopzGarbler, wrk17::Wrk17Garbler},
@@ -14,9 +15,7 @@ use swanky_field_binary::F2;
 macro_rules! bench_full_aes {
     ($garbler:ty,$evaluator:ty,$c:ident,$bench_name:expr) => {{
         let num_parties = 3;
-        let f = std::fs::File::open("circuits/aes_128.txt").unwrap();
-        let buf_reader = BufReader::new(f);
-        let circuit = bristol_fashion::read(buf_reader).unwrap();
+        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
 
         let input_length: u64 = circuit.input_sizes().iter().sum();
         let true_inputs = vec![F2::ZERO; input_length as usize];

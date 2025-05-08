@@ -527,7 +527,6 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
             self.input_shares.push(r);
 
             if !self.is_garbler() {
-                // TODO avoid clone?
                 self.input_keys
                     .push(auth_bits[input_idx].mac_keys.iter().cloned().collect_vec());
             } else {

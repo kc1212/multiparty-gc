@@ -1,9 +1,7 @@
-use std::io::BufReader;
-
 use clap::{Parser, ValueEnum};
 use itertools::Itertools;
 use multiparty_gc::{
-    BenchmarkReport,
+    BenchmarkReport, NamedCircuit,
     evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
     full_simulation,
     garbler::{copz::CopzGarbler, wrk17::Wrk17Garbler},
@@ -55,9 +53,7 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let f = std::fs::File::open(args.circuit.file_name()).unwrap();
-    let buf_reader = BufReader::new(f);
-    let circuit = bristol_fashion::read(buf_reader).unwrap();
+    let circuit = NamedCircuit::from_path(args.circuit.file_name());
 
     let mut rng = AesRng::new();
 
@@ -78,6 +74,7 @@ fn main() {
     let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
     // run the full protocol
+    let benchmark_tag = Some(format!("{:?}", args.protocol).to_ascii_lowercase());
     let report = match args.protocol {
         Protocol::Copz => {
             let garblers = preps
@@ -86,12 +83,11 @@ fn main() {
                 .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, args.num_parties, prep))
                 .collect_vec();
 
-            let benchmark_tag = Some(format!("copz-{:?}", args.circuit));
             full_simulation::<_, CopzEvaluator, _>(
                 garblers,
                 &circuit,
                 true_inputs,
-                false,
+                true,
                 benchmark_tag,
             )
         }
@@ -102,7 +98,6 @@ fn main() {
                 .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, args.num_parties, prep))
                 .collect_vec();
 
-            let benchmark_tag = Some(format!("wrk17-{:?}", args.circuit));
             full_simulation::<_, Wrk17Evaluator, _>(
                 garblers,
                 &circuit,

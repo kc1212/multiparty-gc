@@ -70,7 +70,7 @@ impl Evaluator for CopzEvaluator {
             garbling_shares,
             wire_mask_shares,
             delta,
-        } = garbling.get_evaluator_gates();
+        } = garbling.into_evaluator_gates();
         Self {
             num_parties: total_num_parties,
             garbling_shares,
@@ -116,7 +116,7 @@ impl Evaluator for CopzEvaluator {
         let garblings = transpose(
             garblings
                 .into_iter()
-                .map(|garbling| garbling.get_garbler_gates())
+                .map(|garbling| garbling.into_garbler_gates())
                 .collect_vec(),
         );
 
@@ -285,7 +285,6 @@ impl CopzEvaluator {
                     let [lambda_u, lambda_v, lambda_uv, lambda_w] =
                         &self.garbling_shares[and_gate_counter];
 
-                    // TODO can we skip this computation?
                     let r1_delta = lambda_v.to_x_delta_i_share(self.num_parties - 1, &self.delta);
                     let r2_0_delta = lambda_w.to_x_delta_i_share(self.num_parties - 1, &self.delta)
                         + lambda_uv.to_x_delta_i_share(self.num_parties - 1, &self.delta);

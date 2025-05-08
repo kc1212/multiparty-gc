@@ -1,5 +1,6 @@
 use std::{
-    io::Read,
+    io::{BufReader, Read},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -252,6 +253,39 @@ where
     elapsed
 }
 
+pub struct NamedCircuit {
+    circuit: Circuit,
+    name: String,
+}
+
+impl NamedCircuit {
+    pub fn from_path<P>(path: P) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        let name = path
+            .as_ref()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let f = std::fs::File::open(path).unwrap();
+        let buf_reader = BufReader::new(f);
+        let circuit = bristol_fashion::read(buf_reader).unwrap();
+
+        Self { circuit, name }
+    }
+
+    pub fn input_sizes(&self) -> &Vec<u64> {
+        self.circuit.input_sizes()
+    }
+
+    pub fn nand(&self) -> u64 {
+        self.circuit.nand()
+    }
+}
+
 pub fn full_simulation<
     G: Garbler + Send + 'static,
     E: Evaluator<
@@ -265,7 +299,7 @@ pub fn full_simulation<
     EO: ExtractOutputMsg1<OM1 = G::OM1>,
 >(
     mut garblers: Vec<G>,
-    circuit: &Circuit,
+    circuit: &NamedCircuit,
     true_inputs: Vec<F2>,
     check_output: bool,
     benchmark_tag: Option<String>,
@@ -276,16 +310,22 @@ where
     let party_count = garblers.len();
     let input_count = true_inputs.len();
     let (eval_material, garbling_duration): (EvaluationMaterial<E>, Duration) =
-        simulate_until_eval(&mut garblers, circuit, &true_inputs);
+        simulate_until_eval(&mut garblers, &circuit.circuit, &true_inputs);
 
-    let evaluation_duration =
-        simulate_eval_and_decode(garblers, circuit, true_inputs, eval_material, check_output);
+    let evaluation_duration = simulate_eval_and_decode(
+        garblers,
+        &circuit.circuit,
+        true_inputs,
+        eval_material,
+        check_output,
+    );
 
     BenchmarkReport {
         garbling_duration,
         evaluation_duration,
         party_count,
         input_count,
+        circuit_name: circuit.name.clone(),
         benchmark_tag,
     }
 }
@@ -295,6 +335,7 @@ pub struct BenchmarkReport {
     evaluation_duration: Duration,
     party_count: usize,
     input_count: usize,
+    circuit_name: String,
     benchmark_tag: Option<String>,
 }
 
@@ -304,18 +345,19 @@ impl BenchmarkReport {
     }
 
     pub fn csv_header() -> String {
-        "garbling_duration,evaluation_duration,total_duration,party_count,input_count,tag"
+        "garbling_duration,evaluation_duration,total_duration,party_count,input_count,circuit,tag"
             .to_string()
     }
 
     pub fn csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
             self.garbling_duration.as_millis(),
             self.evaluation_duration.as_millis(),
             self.total_duration().as_millis(),
             self.party_count,
             self.input_count,
+            self.circuit_name,
             match &self.benchmark_tag {
                 Some(tag) => tag,
                 None => "-",
@@ -354,13 +396,12 @@ fn eval_clear_circuit(circuit: &Circuit, inputs: Vec<u8>) -> Vec<u8> {
 mod test {
     use std::io::BufReader;
 
-    use bristol_fashion::Circuit;
     use itertools::Itertools;
     use scuttlebutt::{AesRng, ring::FiniteRing};
     use swanky_field_binary::F2;
 
     use crate::{
-        eval_clear_circuit,
+        NamedCircuit, eval_clear_circuit,
         evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
         full_simulation,
         garbler::{copz::CopzGarbler, wrk17::Wrk17Garbler},
@@ -377,7 +418,7 @@ mod test {
         assert_eq!(eval_clear_circuit(&circuit, vec![1, 1]), vec![1]);
     }
 
-    fn run_wrk17_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
+    fn run_wrk17_insecure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
         let input_wire_count: u64 = circuit.input_sizes().iter().sum();
         let triples = circuit.nand();
         let bits = circuit.nand() + input_wire_count;
@@ -405,7 +446,7 @@ mod test {
         prep_handler.join().unwrap();
     }
 
-    fn run_copz_insecure_prep(circuit: &Circuit, num_parties: u16, true_inputs: Vec<F2>) {
+    fn run_copz_insecure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
         let input_wire_count: u64 = circuit.input_sizes().iter().sum();
         let triples = circuit.nand();
         let bits = circuit.nand() + input_wire_count;
@@ -430,9 +471,7 @@ mod test {
 
     #[test]
     fn test_wrk17_aes() {
-        let f = std::fs::File::open("circuits/aes_128.txt").unwrap();
-        let buf_reader = BufReader::new(f);
-        let circuit = bristol_fashion::read(buf_reader).unwrap();
+        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
         let num_parties = 3;
 
         let input_length: u64 = circuit.input_sizes().iter().sum();
@@ -453,9 +492,7 @@ mod test {
         ];
 
         for (circuit_file, true_inputs) in circuits_inputs {
-            let f = std::fs::File::open(circuit_file).unwrap();
-            let buf_reader = BufReader::new(f);
-            let circuit = bristol_fashion::read(buf_reader).unwrap();
+            let circuit = NamedCircuit::from_path(circuit_file);
             let num_parties = 5;
 
             run_wrk17_insecure_prep(&circuit, num_parties, true_inputs);
@@ -464,9 +501,7 @@ mod test {
 
     #[test]
     fn test_copz_aes() {
-        let f = std::fs::File::open("circuits/aes_128.txt").unwrap();
-        let buf_reader = BufReader::new(f);
-        let circuit = bristol_fashion::read(buf_reader).unwrap();
+        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
         let num_parties = 3;
 
         let input_length: u64 = circuit.input_sizes().iter().sum();
@@ -488,9 +523,7 @@ mod test {
         ];
 
         for (circuit_file, true_inputs) in circuits_inputs {
-            let f = std::fs::File::open(circuit_file).unwrap();
-            let buf_reader = BufReader::new(f);
-            let circuit = bristol_fashion::read(buf_reader).unwrap();
+            let circuit = NamedCircuit::from_path(circuit_file);
             let num_parties = 5;
 
             run_copz_insecure_prep(&circuit, num_parties, true_inputs);
