@@ -51,6 +51,9 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     average_over: u32,
 
+    #[arg(long, default_value = None)]
+    latency_ms: Option<u64>,
+
     #[arg(long)]
     show_header: bool,
 }
@@ -73,6 +76,7 @@ fn bench_once(args: &Args) -> BenchmarkReport {
         true,
         bits as usize,
         triples as usize,
+        args.latency_ms.map(Duration::from_millis),
     );
     let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
@@ -92,6 +96,7 @@ fn bench_once(args: &Args) -> BenchmarkReport {
                 true_inputs,
                 true,
                 benchmark_tag,
+                args.latency_ms.map(Duration::from_millis),
             )
         }
         Protocol::Wrk17 => {
@@ -107,6 +112,7 @@ fn bench_once(args: &Args) -> BenchmarkReport {
                 true_inputs,
                 true,
                 benchmark_tag,
+                args.latency_ms.map(Duration::from_millis),
             )
         }
     };
@@ -136,6 +142,7 @@ fn main() {
         input_count: reports[0].input_count,
         circuit_name: reports[0].circuit_name.clone(),
         benchmark_tag: reports[0].benchmark_tag.clone(),
+        latency: reports[0].latency,
     };
 
     // print the result

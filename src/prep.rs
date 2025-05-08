@@ -1,6 +1,7 @@
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use itertools::Itertools;
 use itertools::izip;
@@ -187,6 +188,7 @@ impl InsecurePreprocessorResp {
 pub struct InsecurePreprocessorRunner {
     recv_chan: Receiver<InsecurePreprocessorReq>,
     send_chans: Vec<Sender<InsecurePreprocessorResp>>,
+    open_delay: Option<Duration>,
 
     deltas: Vec<F128b>,
     auth_bits: Vec<Vec<AuthShare<F2, F128b>>>,
@@ -272,6 +274,9 @@ impl InsecurePreprocessorRunner {
                         .map(|req| verify_and_reconstruct(party_count as u16, req, &self.deltas))
                         .collect::<Result<Vec<_>, GcError>>()?;
 
+                    if let Some(dur) = self.open_delay {
+                        std::thread::sleep(dur);
+                    }
                     match receiver {
                         ReceiverParty::All => {
                             for ch in self.send_chans.iter() {
@@ -392,6 +397,7 @@ impl InsecurePreprocessor {
         tweak_delta_lsb: bool,
         bits: usize,
         triples: usize,
+        open_delay: Option<Duration>,
     ) -> (Vec<Self>, InsecurePreprocessorRunner) {
         let (req_send_chan, req_recv_chan) = mpsc::channel();
         let (resp_send_chans, preps) = (0..party_count)
@@ -448,6 +454,7 @@ impl InsecurePreprocessor {
             send_chans: resp_send_chans,
             auth_bits,
             beaver_triples,
+            open_delay,
         };
 
         (preps, runner)

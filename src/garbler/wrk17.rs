@@ -198,6 +198,16 @@ pub struct Wrk17GarbledGate {
     pub(crate) unencrypted_rows: [AuthShare<F2, F128b>; 4],
 }
 
+impl Wrk17GarbledGate {
+    pub fn len(&self) -> usize {
+        self.rows.iter().map(|z| z.inner.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl Index<u8> for Wrk17GarbledGate {
     type Output = Wrk17GarbledRow;
 
@@ -319,7 +329,14 @@ pub enum Wrk17Garbling {
     Evaluator(Wrk17EvaluatorOutput),
 }
 
-impl Garbling for Wrk17Garbling {}
+impl Garbling for Wrk17Garbling {
+    fn estimate_size(&self) -> usize {
+        match self {
+            Wrk17Garbling::Garbler(gates) => gates.iter().map(|g| g.len()).sum::<usize>(),
+            Wrk17Garbling::Evaluator(_) => 0,
+        }
+    }
+}
 
 impl Wrk17Garbling {
     pub fn get_garbler_gates(self) -> Vec<Wrk17GarbledGate> {

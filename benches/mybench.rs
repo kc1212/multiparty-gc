@@ -29,7 +29,7 @@ macro_rules! bench_full_aes {
             b.iter(|| {
                 let mut rng = AesRng::new();
                 let (preps, runner) =
-                    InsecurePreprocessor::new(&mut rng, num_parties, true, bits, triples);
+                    InsecurePreprocessor::new(&mut rng, num_parties, true, bits, triples, None);
                 let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
                 let garblers = preps
@@ -43,6 +43,7 @@ macro_rules! bench_full_aes {
                     true_inputs.clone(),
                     false,
                     Some($bench_name.to_string()),
+                    None,
                 );
 
                 prep_handler.join().unwrap()

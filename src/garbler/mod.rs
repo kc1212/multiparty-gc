@@ -71,7 +71,10 @@ pub trait Garbler {
     }
 }
 
-pub trait Garbling {}
+pub trait Garbling {
+    // size in bytes
+    fn estimate_size(&self) -> usize;
+}
 
 pub(crate) fn auth_bits_from_prep<P: Preprocessor>(
     prep: &mut P,

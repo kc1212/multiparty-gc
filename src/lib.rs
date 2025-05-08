@@ -6,7 +6,7 @@ use std::{
 
 use bristol_fashion::Circuit;
 use evaluator::Evaluator;
-use garbler::Garbler;
+use garbler::{Garbler, Garbling};
 use generic_array::GenericArray;
 use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng};
@@ -114,6 +114,7 @@ pub fn simulate_until_eval<
     garblers: &mut Vec<G>,
     circuit: &Circuit,
     true_inputs: &[F2],
+    latency: Option<Duration>,
 ) -> (EvaluationMaterial<E>, Duration)
 where
     <G as Garbler>::Gc: Send,
@@ -125,6 +126,8 @@ where
         let mut handles = vec![];
         for (i, garbler) in garblers.iter_mut().enumerate() {
             handles.push(s.spawn(move || {
+                // Communication during garbling assuming preprocessing is completed
+                // is just opening for the Beaver multiplication
                 let mut rng = AesRng::from_entropy();
                 (garbler.garble(&mut rng, circuit), i)
             }));
@@ -140,6 +143,13 @@ where
         gcs
     });
 
+    if let Some(_dur) = latency {
+        let estimate_gc_size: usize = gcs.iter().map(|gc| gc.estimate_size()).sum();
+        const HUNDRED_MEGA_BYTE_PER_MILLIS: usize = 100 * 1024 * 1024 / 8 / 1000;
+        let dur = (estimate_gc_size / HUNDRED_MEGA_BYTE_PER_MILLIS) as u64;
+        std::thread::sleep(Duration::from_millis(dur / (garblers.len() as u64 - 1)));
+    }
+
     let final_garbler = garblers.pop().unwrap();
     let evaluator_gc = gcs.pop().unwrap();
 
@@ -149,6 +159,9 @@ where
         .iter()
         .map(|garbler| garbler.input_round_1())
         .collect_vec();
+    if let Some(dur) = latency {
+        std::thread::sleep(dur);
+    }
 
     // do the second round of communication
     // the evaluator processes the messages and then creates the response
@@ -156,6 +169,9 @@ where
         .input_round_2(true_inputs, msgs_round1)
         .unwrap();
     let masked_inputs = msgs_round2[0].clone().into_masked_inputs();
+    if let Some(dur) = latency {
+        std::thread::sleep(dur);
+    }
 
     // do the final round of communication
     let (msgs_round3, decoder): (Vec<Vec<F128b>>, Vec<_>) = garblers
@@ -163,6 +179,9 @@ where
         .zip(msgs_round2)
         .map(|(garbler, msg)| garbler.input_round_3(msg).into_labels_and_decoder())
         .unzip();
+    if let Some(dur) = latency {
+        std::thread::sleep(dur);
+    }
 
     let evaluator = E::from_garbling(evaluator_gc);
 
@@ -194,6 +213,7 @@ pub fn simulate_eval_and_decode<
     circuit: &Circuit,
     true_inputs: Vec<F2>,
     eval_material: EvaluationMaterial<E>,
+    latency: Option<Duration>,
     check_output: bool,
 ) -> Duration
 where
@@ -214,12 +234,24 @@ where
 
     let mut rng = AesRng::new();
     let output_msgs_1 = encoded_output.extract_outupt_msg1(&mut rng);
-    let chi = if output_msgs_1.is_empty() {
-        [0u8; 32]
-    } else {
+    let has_check_round = !output_msgs_1.is_empty();
+
+    let chi = if has_check_round {
         output_msgs_1[0].chi()
+    } else {
+        [0u8; 32]
     };
 
+    // round of communication for sending chi and h^i to garblers
+    // this is not used for WRK17
+    if has_check_round {
+        if let Some(dur) = latency {
+            std::thread::sleep(dur);
+        }
+    }
+
+    // First rounds of communication
+    // this round is not needed for WRK17
     let output_msgs2 = garblers
         .into_iter()
         .zip(output_msgs_1)
@@ -229,6 +261,14 @@ where
                 .unwrap()
         })
         .collect_vec();
+
+    // round of communication for z^i from garblers to the evaluator
+    // this is not used for WRK17
+    if has_check_round {
+        if let Some(dur) = latency {
+            std::thread::sleep(dur);
+        }
+    }
 
     // now we need to decode the output
     let final_result = evaluator
@@ -303,6 +343,7 @@ pub fn full_simulation<
     true_inputs: Vec<F2>,
     check_output: bool,
     benchmark_tag: Option<String>,
+    latency: Option<Duration>,
 ) -> BenchmarkReport
 where
     <G as Garbler>::Gc: Send,
@@ -310,13 +351,14 @@ where
     let party_count = garblers.len();
     let input_count = true_inputs.len();
     let (eval_material, garbling_duration): (EvaluationMaterial<E>, Duration) =
-        simulate_until_eval(&mut garblers, &circuit.circuit, &true_inputs);
+        simulate_until_eval(&mut garblers, &circuit.circuit, &true_inputs, latency);
 
     let evaluation_duration = simulate_eval_and_decode(
         garblers,
         &circuit.circuit,
         true_inputs,
         eval_material,
+        latency,
         check_output,
     );
 
@@ -327,6 +369,7 @@ where
         input_count,
         circuit_name: circuit.name.clone(),
         benchmark_tag,
+        latency,
     }
 }
 
@@ -337,6 +380,7 @@ pub struct BenchmarkReport {
     pub input_count: usize,
     pub circuit_name: String,
     pub benchmark_tag: Option<String>,
+    pub latency: Option<Duration>,
 }
 
 impl BenchmarkReport {
@@ -345,16 +389,17 @@ impl BenchmarkReport {
     }
 
     pub fn csv_header() -> String {
-        "garbling_duration,evaluation_duration,total_duration,party_count,input_count,circuit,tag"
+        "garbling_duration,evaluation_duration,total_duration,latency,party_count,input_count,circuit,tag"
             .to_string()
     }
 
     pub fn csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             self.garbling_duration.as_millis(),
             self.evaluation_duration.as_millis(),
             self.total_duration().as_millis(),
+            self.latency.unwrap_or_default().as_millis(),
             self.party_count,
             self.input_count,
             self.circuit_name,
@@ -431,6 +476,7 @@ mod test {
             false,
             bits as usize,
             triples as usize,
+            None,
         );
         let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
@@ -440,7 +486,7 @@ mod test {
             .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true, None);
+        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true, None, None);
 
         // shutdown
         prep_handler.join().unwrap();
@@ -453,8 +499,14 @@ mod test {
 
         // prepare preprocessor
         let mut rng = AesRng::new();
-        let (preps, runner) =
-            InsecurePreprocessor::new(&mut rng, num_parties, true, bits as usize, triples as usize);
+        let (preps, runner) = InsecurePreprocessor::new(
+            &mut rng,
+            num_parties,
+            true,
+            bits as usize,
+            triples as usize,
+            None,
+        );
         let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
 
         let garblers = preps
@@ -463,7 +515,7 @@ mod test {
             .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
             .collect_vec();
 
-        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true, None);
+        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true, None, None);
 
         // shutdown
         prep_handler.join().unwrap();

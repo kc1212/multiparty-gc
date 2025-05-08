@@ -90,7 +90,14 @@ pub enum CopzGarbling {
     Evaluator(CopzEvaluatorOutput),
 }
 
-impl Garbling for CopzGarbling {}
+impl Garbling for CopzGarbling {
+    fn estimate_size(&self) -> usize {
+        match self {
+            CopzGarbling::Garbler((gates, _)) => gates.iter().map(|g| g.len()).sum::<usize>(),
+            CopzGarbling::Evaluator(_) => 0,
+        }
+    }
+}
 
 impl CopzGarbling {
     pub fn into_garbler_gates(self) -> Vec<CopzGarbledGate> {
@@ -148,6 +155,16 @@ impl InputMsg3 for CopzInputMsg3 {
 #[derive(Clone)]
 pub struct CopzGarbledGate {
     inner: [Vec<u8>; 3],
+}
+
+impl CopzGarbledGate {
+    pub fn len(&self) -> usize {
+        self.inner.iter().map(|z| z.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 fn lsb_f128b(x: &F128b) -> F2 {
