@@ -331,12 +331,12 @@ where
 }
 
 pub struct BenchmarkReport {
-    garbling_duration: Duration,
-    evaluation_duration: Duration,
-    party_count: usize,
-    input_count: usize,
-    circuit_name: String,
-    benchmark_tag: Option<String>,
+    pub garbling_duration: Duration,
+    pub evaluation_duration: Duration,
+    pub party_count: usize,
+    pub input_count: usize,
+    pub circuit_name: String,
+    pub benchmark_tag: Option<String>,
 }
 
 impl BenchmarkReport {

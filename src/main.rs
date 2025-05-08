@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use clap::{Parser, ValueEnum};
 use itertools::Itertools;
 use multiparty_gc::{
@@ -46,13 +48,14 @@ struct Args {
     #[arg(short, long)]
     circuit: Circuit,
 
+    #[arg(long, default_value_t = 1)]
+    average_over: u32,
+
     #[arg(long)]
     show_header: bool,
 }
 
-fn main() {
-    let args = Args::parse();
-
+fn bench_once(args: &Args) -> BenchmarkReport {
     let circuit = NamedCircuit::from_path(args.circuit.file_name());
 
     let mut rng = AesRng::new();
@@ -109,9 +112,35 @@ fn main() {
     };
     prep_handler.join().unwrap();
 
+    report
+}
+
+fn main() {
+    let args = Args::parse();
+    let reports = (0..args.average_over)
+        .map(|_| bench_once(&args))
+        .collect_vec();
+
+    let final_report = BenchmarkReport {
+        garbling_duration: reports
+            .iter()
+            .map(|r| r.garbling_duration)
+            .sum::<Duration>()
+            / args.average_over,
+        evaluation_duration: reports
+            .iter()
+            .map(|r| r.evaluation_duration)
+            .sum::<Duration>()
+            / args.average_over,
+        party_count: reports[0].party_count,
+        input_count: reports[0].input_count,
+        circuit_name: reports[0].circuit_name.clone(),
+        benchmark_tag: reports[0].benchmark_tag.clone(),
+    };
+
     // print the result
     if args.show_header {
         println!("{}", BenchmarkReport::csv_header());
     }
-    println!("{}", report.csv());
+    println!("{}", final_report.csv());
 }
