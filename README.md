@@ -1,6 +1,8 @@
 # multiparty-gc
 
-This is a proof concept implementation of the WRK17 and COPZ25 garbling scheme.
+This is a proof concept implementation of the [COPZ25](https://eprint.iacr.org/2025/829) garbling scheme
+(only the authenticated variant, not the HSS17 variant).
+We also give an implementation of [WRK17](https://eprint.iacr.org/2017/189) for comparison.
 
 ## Profiling
 
