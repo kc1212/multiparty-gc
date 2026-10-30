@@ -47,6 +47,20 @@ The command line tool runs all parties in one process over the in-memory
 transport; `--latency-ms` and `--bandwidth-mbps` set the one-way latency and
 bandwidth of every link.
 
+To run the parties as separate processes over QUIC (mutual TLS 1.3 with a
+pinned certificate per party), first generate certificates, keys and a
+configuration, then start one process per party. The last party is the
+evaluator, it checks the output and prints the CSV line.
+
+```
+cargo run --release -- gen-config -n 3 --dir quic --base-port 7000
+cargo run --release -- -n 3 -p copz -c aes128 --prep secure \
+    --party-id 0 --config quic/parties.conf --key quic/party0.key.pem
+```
+
+Each line of `parties.conf` is `<party id> <address> <certificate file>`. In
+this mode `prep_bytes` and `online_bytes` only count the evaluator's traffic.
+
 The CSV output reports `prep_duration` (the function-independent
 preprocessing, not part of `total_duration`), and the bytes sent by all
 parties on the preprocessing session (`prep_bytes`, which includes the

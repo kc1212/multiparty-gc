@@ -26,6 +26,9 @@ use thiserror::Error;
 
 mod inbox;
 pub mod memory;
+pub mod quic;
+#[cfg(test)]
+mod quic_tests;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -189,9 +192,12 @@ impl NetInner {
 impl Drop for NetInner {
     fn drop(&mut self) {
         if !self.is_aborted() {
-            for link in self.links.iter().flatten() {
-                link.close();
-            }
+            // a graceful close may wait for the peer, so we close all links concurrently
+            std::thread::scope(|s| {
+                for link in self.links.iter().flatten() {
+                    s.spawn(|| link.close());
+                }
+            });
         }
     }
 }

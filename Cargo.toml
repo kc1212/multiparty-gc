@@ -15,6 +15,10 @@ blake3 = "1.6.1"
 generic-array = "1.1.1"
 smallvec = "1.15.0"
 clap = { version = "4.5.37", features = ["derive"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 # serde = { version = "1.0.219", features = ["derive"] }
 
 [dev-dependencies]

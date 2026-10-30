@@ -192,6 +192,26 @@ impl NamedCircuit {
     pub fn nand(&self) -> u64 {
         self.circuit.nand()
     }
+
+    pub fn circuit(&self) -> &Circuit {
+        &self.circuit
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Evaluate the circuit in the clear.
+    pub fn eval_clear(&self, inputs: &[F2]) -> Vec<F2> {
+        let inputs = inputs
+            .iter()
+            .map(|x| if *x == F2::ZERO { 0u8 } else { 1u8 })
+            .collect_vec();
+        eval_clear_circuit(&self.circuit, inputs)
+            .into_iter()
+            .map(|x| F2::from(x == 1))
+            .collect_vec()
+    }
 }
 
 /// The network and sessions of one party.
@@ -298,15 +318,7 @@ where
     let report = reports.pop().expect("at least two parties");
 
     if check_output {
-        let plain_eval_inputs = true_inputs
-            .iter()
-            .map(|x| if *x == F2::ZERO { 0u8 } else { 1u8 })
-            .collect_vec();
-        let expected_result = eval_clear_circuit(&circuit.circuit, plain_eval_inputs)
-            .into_iter()
-            .map(|x| F2::from_bytes(&[x].into()).unwrap())
-            .collect_vec();
-        assert_eq!(report.outputs, Some(expected_result));
+        assert_eq!(report.outputs, Some(circuit.eval_clear(&true_inputs)));
     }
 
     Ok(BenchmarkReport {

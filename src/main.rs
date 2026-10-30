@@ -1,15 +1,24 @@
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use itertools::Itertools;
 use multiparty_gc::{
     BenchmarkReport, NamedCircuit, SimParty,
+    driver::run_party,
     error::GcError,
     evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
     full_simulation,
     garbler::{copz::CopzGarbler, wrk17::Wrk17Garbler},
     in_memory_setup,
-    net::{Network, Session, memory::LinkModel},
+    net::{
+        NetError, Network, Session,
+        memory::LinkModel,
+        quic::{self, Identity, QuicConfig, certificate_from_pem},
+    },
     prep::{InsecurePreprocessor, Preprocessor, SecurePrepParams, SecurePreprocessor, run_prep},
 };
 use rand::Rng;
@@ -49,17 +58,24 @@ enum Prep {
 }
 
 /// Benchmark multiparty garbling and preprocessing.
+///
+/// By default all parties run in this process over an in-memory network. With
+/// `--party-id`, `--config` and `--key`, this process runs a single party that connects
+/// to the other parties over QUIC, see the `gen-config` command.
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     #[arg(short, long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(2..))]
     num_parties: u16,
 
-    #[arg(short, long)]
-    protocol: Protocol,
+    #[arg(short, long, required = true)]
+    protocol: Option<Protocol>,
 
-    #[arg(short, long)]
-    circuit: Circuit,
+    #[arg(short, long, required = true)]
+    circuit: Option<Circuit>,
 
     #[arg(long, value_enum, default_value_t = Prep::Insecure)]
     prep: Prep,
@@ -85,6 +101,48 @@ struct Args {
 
     #[arg(long)]
     show_header: bool,
+
+    /// Run only this party over QUIC, the last party is the evaluator.
+    #[arg(long, requires_all = ["config", "key"])]
+    party_id: Option<u16>,
+
+    /// The parties' addresses and certificates, see `gen-config`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// The private key (PEM) of this party.
+    #[arg(long)]
+    key: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Generate certificates, keys and a configuration for parties on one host.
+    GenConfig {
+        #[arg(short, long, value_parser = clap::value_parser!(u16).range(2..))]
+        num_parties: u16,
+
+        /// Directory for the files, it is created if needed.
+        #[arg(long)]
+        dir: PathBuf,
+
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Party `i` listens on `base-port + i`.
+        #[arg(long, default_value_t = 7000)]
+        base_port: u16,
+    },
+}
+
+impl Args {
+    fn protocol(&self) -> &Protocol {
+        self.protocol.as_ref().expect("required by clap")
+    }
+
+    fn circuit(&self) -> &Circuit {
+        self.circuit.as_ref().expect("required by clap")
+    }
 }
 
 fn run_protocol<P: Preprocessor + Send + 'static>(
@@ -94,13 +152,13 @@ fn run_protocol<P: Preprocessor + Send + 'static>(
     others: Vec<(Session, Network)>,
     true_inputs: Vec<F2>,
 ) -> Result<BenchmarkReport, GcError> {
-    let mut benchmark_tag = format!("{:?}", args.protocol).to_ascii_lowercase();
+    let mut benchmark_tag = format!("{:?}", args.protocol()).to_ascii_lowercase();
     if matches!(args.prep, Prep::Secure) {
         benchmark_tag.push_str("+secure_prep");
     }
     let latency = args.latency_ms.map(Duration::from_millis);
     let n = args.num_parties;
-    match args.protocol {
+    match args.protocol() {
         Protocol::Copz => {
             let parties = preps
                 .into_iter()
@@ -145,7 +203,7 @@ fn run_protocol<P: Preprocessor + Send + 'static>(
 }
 
 fn bench_once(args: &Args) -> Result<BenchmarkReport, GcError> {
-    let circuit = NamedCircuit::from_path(args.circuit.file_name());
+    let circuit = NamedCircuit::from_path(args.circuit().file_name());
 
     let mut rng = AesRng::new();
 
@@ -203,8 +261,208 @@ fn bench_once(args: &Args) -> Result<BenchmarkReport, GcError> {
     }
 }
 
+/// Write a certificate and key for every party and a configuration listing
+/// `<party id> <address> <certificate file>` per line.
+fn gen_config(num_parties: u16, dir: &Path, host: &str, base_port: u16) -> Result<(), GcError> {
+    let io = |e: std::io::Error| GcError::Net(NetError::Config(e.to_string()));
+    std::fs::create_dir_all(dir).map_err(io)?;
+    let mut config = String::from("# party address certificate\n");
+    for i in 0..num_parties {
+        let (cert, key) = Identity::generate_pem()?;
+        let cert_file = format!("party{i}.cert.pem");
+        std::fs::write(dir.join(&cert_file), cert).map_err(io)?;
+        std::fs::write(dir.join(format!("party{i}.key.pem")), key).map_err(io)?;
+        let port = base_port
+            .checked_add(i)
+            .ok_or_else(|| GcError::Net(NetError::Config("port out of range".into())))?;
+        config.push_str(&format!("{i} {host}:{port} {cert_file}\n"));
+    }
+    std::fs::write(dir.join("parties.conf"), config).map_err(io)?;
+    Ok(())
+}
+
+/// Parse the configuration written by [gen_config], certificate paths are relative to it.
+fn read_config(
+    path: &Path,
+) -> Result<Vec<(SocketAddr, rustls::pki_types::CertificateDer<'static>)>, GcError> {
+    let err = |msg: String| GcError::Net(NetError::Config(msg));
+    let text = std::fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    let mut parties = vec![];
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split_whitespace().collect_vec();
+        let [id, addr, cert] = fields[..] else {
+            return Err(err(format!("invalid line: {line}")));
+        };
+        let id: usize = id
+            .parse()
+            .map_err(|_| err(format!("invalid party: {id}")))?;
+        if id != parties.len() {
+            return Err(err("parties must be listed in order starting from 0".into()));
+        }
+        let addr = addr
+            .parse()
+            .map_err(|_| err(format!("invalid address: {addr}")))?;
+        let pem = std::fs::read(base.join(cert)).map_err(|e| err(format!("{cert}: {e}")))?;
+        parties.push((addr, certificate_from_pem(&pem)?));
+    }
+    Ok(parties)
+}
+
+/// Run a single party over QUIC, only the evaluator returns a report.
+fn run_networked(args: &Args, party_id: u16) -> Result<Option<BenchmarkReport>, GcError> {
+    let config = args.config.as_ref().expect("required by clap");
+    let key = args.key.as_ref().expect("required by clap");
+    let peers = read_config(config)?;
+    let n = peers.len() as u16;
+    if n != args.num_parties || party_id >= n {
+        return Err(GcError::Net(NetError::Config(format!(
+            "the configuration has {n} parties but -n is {}",
+            args.num_parties
+        ))));
+    }
+    let key = std::fs::read(key).map_err(|e| GcError::Net(NetError::Config(e.to_string())))?;
+    let certificate = peers[party_id as usize].1.clone();
+    let identity = Identity::from_certificate_and_key_pem(certificate, &key)?;
+    let network = quic::connect(party_id, identity, &peers, QuicConfig::default())?;
+
+    let circuit = NamedCircuit::from_path(args.circuit().file_name());
+    let mut rng = AesRng::new();
+    let input_length: u64 = circuit.input_sizes().iter().sum();
+    let triples = circuit.nand() as usize;
+    let bits = (circuit.nand() + input_length) as usize;
+    let evaluator = n - 1;
+    let inputs: Option<Vec<F2>> =
+        (party_id == evaluator).then(|| (0..input_length).map(|_| F2::random(&mut rng)).collect());
+
+    let prep_session = network.session("prep")?;
+    let mut online = network.session("online")?;
+    let start = Instant::now();
+    let report = match args.prep {
+        Prep::Insecure => {
+            // the dealer's seed only needs to be shared, this preprocessing is insecure anyway
+            let seed = network.session("insecure dealer seed")?.coin(&mut rng)?;
+            let mut prep = InsecurePreprocessor::new(prep_session, seed, true, bits, triples);
+            prep.prep()?;
+            let prep_duration = start.elapsed();
+            run_one(
+                args,
+                party_id,
+                n,
+                prep,
+                &mut online,
+                &circuit,
+                inputs.as_deref(),
+            )?
+            .map(|r| (r, prep_duration))
+        }
+        Prep::Secure => {
+            let params = SecurePrepParams {
+                rho: args.rho,
+                bucket_size: args.bucket_size,
+            };
+            let mut prep =
+                SecurePreprocessor::new(prep_session, &mut rng, true, bits, triples, params)?;
+            prep.prep()?;
+            let prep_duration = start.elapsed();
+            run_one(
+                args,
+                party_id,
+                n,
+                prep,
+                &mut online,
+                &circuit,
+                inputs.as_deref(),
+            )?
+            .map(|r| (r, prep_duration))
+        }
+    };
+    let Some((report, prep_duration)) = report else {
+        return Ok(None);
+    };
+    let outputs = report.outputs.expect("the evaluator has outputs");
+    assert_eq!(outputs, circuit.eval_clear(inputs.as_deref().unwrap()));
+
+    let mut tag = format!("{:?}", args.protocol()).to_ascii_lowercase();
+    if matches!(args.prep, Prep::Secure) {
+        tag.push_str("+secure_prep");
+    }
+    tag.push_str("+quic");
+    let stats = network.stats();
+    let bytes = |label: &str| {
+        stats
+            .iter()
+            .filter(|(l, _)| (l == "online") == (label == "online"))
+            .map(|(_, s)| s.bytes_sent)
+            .sum()
+    };
+    Ok(Some(BenchmarkReport {
+        prep_duration,
+        garbling_duration: report.garbling_duration,
+        evaluation_duration: report.evaluation_duration,
+        party_count: n as usize,
+        input_count: input_length as usize,
+        circuit_name: circuit.name().to_string(),
+        benchmark_tag: Some(tag),
+        latency: None,
+        // only the bytes sent by the evaluator
+        prep_bytes: bytes("prep"),
+        online_bytes: bytes("online"),
+    }))
+}
+
+fn run_one<P: Preprocessor>(
+    args: &Args,
+    party_id: u16,
+    n: u16,
+    prep: P,
+    online: &mut Session,
+    circuit: &NamedCircuit,
+    inputs: Option<&[F2]>,
+) -> Result<Option<multiparty_gc::driver::PartyReport>, GcError> {
+    let mut rng = AesRng::new();
+    let report = match args.protocol() {
+        Protocol::Copz => run_party::<_, CopzEvaluator, _>(
+            CopzGarbler::new(party_id, n, prep),
+            online,
+            circuit.circuit(),
+            inputs,
+            &mut rng,
+        )?,
+        Protocol::Wrk17 => run_party::<_, Wrk17Evaluator, _>(
+            Wrk17Garbler::new(party_id, n, prep),
+            online,
+            circuit.circuit(),
+            inputs,
+            &mut rng,
+        )?,
+    };
+    Ok(report.outputs.is_some().then_some(report))
+}
+
 fn main() -> Result<(), GcError> {
     let args = Args::parse();
+    if let Some(Command::GenConfig {
+        num_parties,
+        dir,
+        host,
+        base_port,
+    }) = &args.command
+    {
+        return gen_config(*num_parties, dir, host, *base_port);
+    }
+    if let Some(party_id) = args.party_id {
+        if let Some(report) = run_networked(&args, party_id)? {
+            if args.show_header {
+                println!("{}", BenchmarkReport::csv_header());
+            }
+            println!("{}", report.csv());
+        }
+        return Ok(());
+    }
     let reports = (0..args.average_over)
         .map(|_| bench_once(&args))
         .collect::<Result<Vec<_>, _>>()?;
