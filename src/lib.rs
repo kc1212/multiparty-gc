@@ -363,6 +363,7 @@ where
     );
 
     BenchmarkReport {
+        prep_duration: Duration::ZERO,
         garbling_duration,
         evaluation_duration,
         party_count,
@@ -374,6 +375,8 @@ where
 }
 
 pub struct BenchmarkReport {
+    /// Duration of the function-independent preprocessing, it is not part of [Self::total_duration].
+    pub prep_duration: Duration,
     pub garbling_duration: Duration,
     pub evaluation_duration: Duration,
     pub party_count: usize,
@@ -389,13 +392,13 @@ impl BenchmarkReport {
     }
 
     pub fn csv_header() -> String {
-        "garbling_duration,evaluation_duration,total_duration,latency,party_count,input_count,circuit,tag"
+        "garbling_duration,evaluation_duration,total_duration,latency,party_count,input_count,circuit,tag,prep_duration"
             .to_string()
     }
 
     pub fn csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             self.garbling_duration.as_millis(),
             self.evaluation_duration.as_millis(),
             self.total_duration().as_millis(),
@@ -407,6 +410,7 @@ impl BenchmarkReport {
                 Some(tag) => tag,
                 None => "-",
             },
+            self.prep_duration.as_millis(),
         )
     }
 }
@@ -450,7 +454,7 @@ mod test {
         evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
         full_simulation,
         garbler::{copz::CopzGarbler, wrk17::Wrk17Garbler},
-        prep::InsecurePreprocessor,
+        prep::{InsecurePreprocessor, SecurePrepParams, SecurePreprocessor, run_prep},
     };
 
     #[test]
@@ -519,6 +523,95 @@ mod test {
 
         // shutdown
         prep_handler.join().unwrap();
+    }
+
+    /// Run the secure preprocessing for all parties.
+    fn secure_preps(
+        circuit: &NamedCircuit,
+        num_parties: u16,
+        tweak_delta_lsb: bool,
+    ) -> Vec<SecurePreprocessor> {
+        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
+        let triples = circuit.nand();
+        let bits = circuit.nand() + input_wire_count;
+
+        let mut rng = AesRng::new();
+        let preps = SecurePreprocessor::new(
+            &mut rng,
+            num_parties,
+            tweak_delta_lsb,
+            bits as usize,
+            triples as usize,
+            SecurePrepParams::default(),
+            None,
+        )
+        .unwrap();
+        run_prep(preps).unwrap()
+    }
+
+    fn run_wrk17_secure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
+        let garblers = secure_preps(circuit, num_parties, false)
+            .into_iter()
+            .enumerate()
+            .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
+            .collect_vec();
+        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true, None, None);
+    }
+
+    fn run_copz_secure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
+        let garblers = secure_preps(circuit, num_parties, true)
+            .into_iter()
+            .enumerate()
+            .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
+            .collect_vec();
+        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true, None, None);
+    }
+
+    fn basic_circuits_inputs() -> Vec<(&'static str, Vec<F2>)> {
+        vec![
+            ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ZERO, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
+        ]
+    }
+
+    #[test]
+    fn test_wrk17_secure_basic() {
+        for (circuit_file, true_inputs) in basic_circuits_inputs() {
+            let circuit = NamedCircuit::from_path(circuit_file);
+            run_wrk17_secure_prep(&circuit, 4, true_inputs);
+        }
+    }
+
+    #[test]
+    fn test_copz_secure_basic() {
+        for (circuit_file, true_inputs) in basic_circuits_inputs() {
+            let circuit = NamedCircuit::from_path(circuit_file);
+            run_copz_secure_prep(&circuit, 4, true_inputs);
+        }
+    }
+
+    #[test]
+    fn test_wrk17_secure_aes() {
+        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
+        let mut rng = AesRng::new();
+        let input_length: u64 = circuit.input_sizes().iter().sum();
+        let true_inputs = (0..input_length).map(|_| F2::random(&mut rng)).collect();
+        run_wrk17_secure_prep(&circuit, 3, true_inputs);
+    }
+
+    #[test]
+    fn test_copz_secure_aes() {
+        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
+        let mut rng = AesRng::new();
+        let input_length: u64 = circuit.input_sizes().iter().sum();
+        let true_inputs = (0..input_length).map(|_| F2::random(&mut rng)).collect();
+        run_copz_secure_prep(&circuit, 3, true_inputs);
     }
 
     #[test]

@@ -364,6 +364,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -649,6 +658,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyed_arena"
+version = "0.6.0"
+source = "git+https://github.com/GaloisInc/swanky?rev=cd3862a#cd3862acd39631cfc463f977028d792f9fb757d8"
+dependencies = [
+ "bumpalo",
+ "crossbeam-queue",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -698,6 +716,7 @@ dependencies = [
  "criterion",
  "generic-array 1.1.1",
  "itertools 0.13.0",
+ "ocelot",
  "rand",
  "scuttlebutt",
  "smallvec",
@@ -774,6 +793,24 @@ checksum = "4161fcb6d602d4d2081af7c3a45852d875a03dd337a6bfdd6e06407b61342a43"
 dependencies = [
  "hermit-abi 0.3.9",
  "libc",
+]
+
+[[package]]
+name = "ocelot"
+version = "0.6.0"
+source = "git+https://github.com/GaloisInc/swanky?rev=cd3862a#cd3862acd39631cfc463f977028d792f9fb757d8"
+dependencies = [
+ "arrayvec",
+ "blake3",
+ "bytemuck",
+ "cc",
+ "curve25519-dalek",
+ "generic-array 1.1.1",
+ "keyed_arena",
+ "rand",
+ "scuttlebutt",
+ "subtle",
+ "vectoreyes",
 ]
 
 [[package]]

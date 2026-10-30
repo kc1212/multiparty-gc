@@ -24,6 +24,22 @@ pub enum GcError {
     OutputCheckFailure(String),
     #[error("Wrong party received opening {0}")]
     WrongOpening(String),
+    #[error("Cheating detected: {0}")]
+    CheatDetected(String),
+    #[error("Network error: {0}")]
+    NetworkError(String),
+    #[error("Oblivious transfer error: {0}")]
+    OtError(String),
+    #[error("Not enough preprocessed material: {0}")]
+    NotEnoughMaterial(String),
+    #[error("Invalid preprocessing parameters: {0}")]
+    InvalidPrepParams(String),
+}
+
+impl From<ocelot::Error> for GcError {
+    fn from(err: ocelot::Error) -> Self {
+        Self::OtError(err.to_string())
+    }
 }
 
 impl<T> From<SendError<T>> for GcError {
