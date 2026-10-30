@@ -157,7 +157,7 @@ fn bench_once(args: &Args) -> Result<BenchmarkReport, GcError> {
                 rho: args.rho,
                 bucket_size: args.bucket_size,
             };
-            let preps = SecurePreprocessor::new(
+            let preps = SecurePreprocessor::new_in_memory(
                 &mut rng,
                 args.num_parties,
                 true,

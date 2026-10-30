@@ -4,14 +4,14 @@ use ocelot::ot::{
     Receiver as OtReceiver,
 };
 use rand::{Rng, SeedableRng};
-use scuttlebutt::{AesRng, Block, SymChannel, ring::FiniteRing, serialization::CanonicalSerialize};
+use scuttlebutt::{AesRng, Block, ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
 use super::{
     Cheat, F128B_LEN, SecurePreprocessor, block_to_f128b, bytes_to_f128b, f128b_to_bytes, mul_bit,
     seed_to_block,
 };
-use crate::prep::network::{COMMITMENT_LEN, NONCE_LEN, commit, verify_commitment};
+use crate::net::{COMMITMENT_LEN, NONCE_LEN};
 use crate::{error::GcError, sharing::AuthShare};
 
 impl SecurePreprocessor {
@@ -67,22 +67,20 @@ impl SecurePreprocessor {
         let flip_bit = self.cheating(Cheat::AbitInconsistentBits);
         let bad_delta = self.cheating(Cheat::InconsistentDelta);
         let delta_bytes: [u8; 16] = self.delta.to_bytes().into();
-        let seeds = self
-            .net
-            .peers()
+        let channels = self.session.pairwise_channels()?;
+        let seeds = channels
+            .iter()
             .map(|_| Block::from(self.rng.r#gen::<u128>()))
             .collect_vec();
 
         // Run the OTs with every peer in its own thread so that no party waits on another
         let results = std::thread::scope(|s| {
-            let handles = self
-                .net
-                .links_mut()
+            let handles = channels
+                .into_iter()
                 .zip(seeds)
-                .map(|((peer, link), seed)| {
+                .map(|((peer, mut channel), seed)| {
                     s.spawn(move || -> Result<_, GcError> {
                         let mut rng = AesRng::from_seed(seed);
-                        let mut channel = SymChannel::new(link);
                         let mut bits = bits.to_vec();
                         if flip_bit && peer == victim {
                             bits[0] = !bits[0];
@@ -144,7 +142,7 @@ impl SecurePreprocessor {
     ) -> Result<(), GcError> {
         let rho = self.rho;
         let n = self.party_count as usize;
-        let peers = self.net.peers().map(|p| p as usize).collect_vec();
+        let peers = self.session.peers().map(|p| p as usize).collect_vec();
         let mask = if rho == 128 {
             u128::MAX
         } else {
@@ -173,12 +171,12 @@ impl SecurePreprocessor {
             }
         }
 
-        let all_bits = self.net.broadcast(&combined_bits.to_le_bytes(), 16)?;
+        let all_bits = self.session.broadcast_all(&combined_bits.to_le_bytes())?;
         let msgs = combined_macs
             .iter()
             .map(|m| f128b_to_bytes(m))
             .collect_vec();
-        let received = self.net.exchange(&msgs, rho * F128B_LEN)?;
+        let received = self.session.exchange(&msgs, rho * F128B_LEN)?;
         for &i in &peers {
             let their_bits = u128::from_le_bytes(all_bits[i].as_slice().try_into().unwrap());
             let their_macs = bytes_to_f128b(&received[i]);
@@ -204,7 +202,7 @@ impl SecurePreprocessor {
     fn check_delta_consistency(&mut self, shares: &[AuthShare<F2, F128b>]) -> Result<(), GcError> {
         let n = self.party_count as usize;
         let me = self.party_id as usize;
-        let peers = self.net.peers().map(|p| p as usize).collect_vec();
+        let peers = self.session.peers().map(|p| p as usize).collect_vec();
         // a bit and n MACs (including the empty one for ourselves)
         let mac_msg_len = 1 + n * F128B_LEN;
         let mac_opening_len = mac_msg_len + NONCE_LEN;
@@ -216,22 +214,18 @@ impl SecurePreprocessor {
         for share in shares {
             let key0 = share.sum_mac_keys();
             let key1 = key0 + self.delta;
-            let (com0, nonce0) = commit(&mut self.rng, &key0.to_bytes());
-            let (com1, nonce1) = commit(&mut self.rng, &key1.to_bytes());
+            let (com0, nonce0) = self.session.commit(&mut self.rng, &key0.to_bytes());
+            let (com1, nonce1) = self.session.commit(&mut self.rng, &key1.to_bytes());
             let mac_msg = std::iter::once(bool::from(share.share) as u8)
                 .chain(f128b_to_bytes(&share.mac_values))
                 .collect_vec();
-            let (com_mac, nonce_mac) = commit(&mut self.rng, &mac_msg);
+            let (com_mac, nonce_mac) = self.session.commit(&mut self.rng, &mac_msg);
             my_coms.extend(com0.into_iter().chain(com1).chain(com_mac));
             my_mac_openings.extend(mac_msg.into_iter().chain(nonce_mac));
             key_openings.push([(key0, nonce0), (key1, nonce1)]);
         }
-        let coms = self
-            .net
-            .broadcast(&my_coms, shares.len() * 3 * COMMITMENT_LEN)?;
-        let mac_openings = self
-            .net
-            .broadcast(&my_mac_openings, shares.len() * mac_opening_len)?;
+        let coms = self.session.broadcast_all(&my_coms)?;
+        let mac_openings = self.session.broadcast_all(&my_mac_openings)?;
 
         // bits[i][r] and macs[i][r][k] = M_k[x^i_r]
         let mut bits = vec![vec![false; shares.len()]; n];
@@ -241,7 +235,7 @@ impl SecurePreprocessor {
                 let opening = &mac_openings[i][r * mac_opening_len..(r + 1) * mac_opening_len];
                 let (msg, nonce) = opening.split_at(mac_msg_len);
                 let com = &coms[i][(r * 3 + 2) * COMMITMENT_LEN..(r * 3 + 3) * COMMITMENT_LEN];
-                if !verify_commitment(com, msg, nonce) || msg[0] > 1 {
+                if !self.session.verify_commitment(com, msg, nonce) || msg[0] > 1 {
                     self.detected(GcError::CheatDetected(format!(
                         "party {i} opened a MAC commitment incorrectly"
                     )))?;
@@ -264,9 +258,7 @@ impl SecurePreprocessor {
                 key.to_bytes().into_iter().chain(nonce)
             })
             .collect_vec();
-        let all_key_openings = self
-            .net
-            .broadcast(&my_key_openings, shares.len() * key_opening_len)?;
+        let all_key_openings = self.session.broadcast_all(&my_key_openings)?;
 
         for &i in &peers {
             for r in 0..shares.len() {
@@ -277,7 +269,9 @@ impl SecurePreprocessor {
                 let expected = (0..n)
                     .filter(|k| *k != i)
                     .fold(F128b::ZERO, |acc, k| acc + macs[k][r][i]);
-                if !verify_commitment(com, key, nonce) || bytes_to_f128b(key)[0] != expected {
+                if !self.session.verify_commitment(com, key, nonce)
+                    || bytes_to_f128b(key)[0] != expected
+                {
                     self.detected(GcError::CheatDetected(format!(
                         "global key consistency check failed for party {i}"
                     )))?;

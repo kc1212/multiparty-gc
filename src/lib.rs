@@ -537,7 +537,7 @@ mod test {
         let bits = circuit.nand() + input_wire_count;
 
         let mut rng = AesRng::new();
-        let preps = SecurePreprocessor::new(
+        let preps = SecurePreprocessor::new_in_memory(
             &mut rng,
             num_parties,
             tweak_delta_lsb,

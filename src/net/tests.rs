@@ -30,12 +30,13 @@ fn run_all<T: Send>(nets: Vec<Network>, f: impl Fn(Network) -> T + Sync) -> Vec<
 }
 
 fn default_mesh(n: u16) -> Vec<Network> {
-    mesh(n, LinkModel::default(), NetworkConfig::default())
+    mesh(n, LinkModel::default(), NetworkConfig::default()).unwrap()
 }
 
 #[test]
 fn test_network_new_validates_links() {
     let config = NetworkConfig::default();
+    assert!(mesh(1, LinkModel::default(), config).is_err());
     assert!(Network::new(0, vec![None], config).is_err());
     assert!(Network::new(2, vec![None, None], config).is_err());
     // the own link must be missing and all others present
@@ -260,7 +261,7 @@ fn test_timeout() {
     let config = NetworkConfig {
         timeout: Duration::from_millis(100),
     };
-    let mut nets = mesh(2, LinkModel::default(), config);
+    let mut nets = mesh(2, LinkModel::default(), config).unwrap();
     let _silent = nets.remove(0);
     let net = nets.remove(0);
     let mut s = net.session("s").unwrap();
@@ -286,7 +287,8 @@ fn test_link_model() {
             bandwidth: Some(10_000_000),
         },
         NetworkConfig::default(),
-    );
+    )
+    .unwrap();
     let outputs = run_all(nets, |net| {
         let mut s = net.session("s").unwrap();
         let start = Instant::now();

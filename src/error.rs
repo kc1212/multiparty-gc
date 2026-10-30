@@ -28,8 +28,6 @@ pub enum GcError {
     WrongOpening(String),
     #[error("Cheating detected: {0}")]
     CheatDetected(String),
-    #[error("Network error: {0}")]
-    NetworkError(String),
     #[error(transparent)]
     Net(NetError),
     #[error("Oblivious transfer error: {0}")]

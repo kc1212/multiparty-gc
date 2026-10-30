@@ -32,7 +32,14 @@ impl LinkModel {
 
 /// Create fully connected networks for `party_count` parties in this process,
 /// the network of party `i` is at index `i`.
-pub fn mesh(party_count: u16, model: LinkModel, config: NetworkConfig) -> Vec<Network> {
+pub fn mesh(
+    party_count: u16,
+    model: LinkModel,
+    config: NetworkConfig,
+) -> Result<Vec<Network>, NetError> {
+    if party_count < 2 {
+        return Err(NetError::Config("need at least two parties".into()));
+    }
     let n = party_count as usize;
     // inboxes[i][j] holds the frames sent by party j to party i
     let inboxes: Vec<Vec<Arc<Inbox>>> = (0..n)
@@ -59,7 +66,7 @@ pub fn mesh(party_count: u16, model: LinkModel, config: NetworkConfig) -> Vec<Ne
                     })
                 })
                 .collect();
-            Network::new(i as PartyId, links, config).expect("valid mesh")
+            Network::new(i as PartyId, links, config)
         })
         .collect()
 }

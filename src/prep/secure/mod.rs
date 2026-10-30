@@ -32,12 +32,19 @@ pub use params::SecurePrepParams;
 
 use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng};
-use scuttlebutt::{AES_HASH, AesRng, Block, ring::FiniteRing, serialization::CanonicalSerialize};
+use scuttlebutt::{AesHash, AesRng, Block, ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
-use crate::{error::GcError, sharing::AuthShare};
+use crate::{
+    error::GcError,
+    net::{
+        NetworkConfig, Session,
+        memory::{LinkModel, mesh},
+    },
+    sharing::AuthShare,
+};
 
-use super::{Preprocessor, ReceiverParty, StaticPreprocessor, Triple, network::PartyNet};
+use super::{Preprocessor, ReceiverParty, StaticPreprocessor, Triple};
 
 const F128B_LEN: usize = 16;
 
@@ -79,14 +86,17 @@ enum HashDomain {
 
 /// Maliciously secure preprocessor, see the module documentation.
 ///
-/// All parties must be created together with [SecurePreprocessor::new]
-/// and run [Preprocessor::prep] concurrently, e.g., with [super::run_prep],
+/// Every party creates its preprocessor with [SecurePreprocessor::new] from a [Session]
+/// that is used for all its communication, all parties must use the same parameters.
+/// They must run [Preprocessor::prep] concurrently, e.g., with [super::run_prep],
 /// before the material can be used.
 pub struct SecurePreprocessor {
     party_id: u16,
     party_count: u16,
     delta: F128b,
-    net: PartyNet,
+    session: Session,
+    /// Key of the TCCR hash, derived from the session ID.
+    tccr_key: Block,
     rng: AesRng,
     rho: usize,
     bucket_size: usize,
@@ -104,24 +114,19 @@ pub struct SecurePreprocessor {
 }
 
 impl SecurePreprocessor {
-    /// Create connected preprocessors for `party_count` parties that will generate
+    /// Create the preprocessor of the party that owns `session`, it will generate
     /// `bits` random authenticated bits and `triples` AND triples.
     ///
     /// If `tweak_delta_lsb` is set, party 0 chooses a global key with `lsb(Δ_0) = 1`.
     pub fn new<R: Rng + CryptoRng>(
+        session: Session,
         rng: &mut R,
-        party_count: u16,
         tweak_delta_lsb: bool,
         bits: usize,
         triples: usize,
         params: SecurePrepParams,
         open_delay: Option<Duration>,
-    ) -> Result<Vec<Self>, GcError> {
-        if party_count < 2 {
-            return Err(GcError::InvalidPrepParams(
-                "need at least two parties".into(),
-            ));
-        }
+    ) -> Result<Self, GcError> {
         let bucket_size = params.bucket_size_for(triples)?;
         // Validate all material and field-message sizes before starting any party.
         triples
@@ -132,36 +137,61 @@ impl SecurePreprocessor {
             .and_then(|count| count.checked_mul(F128B_LEN))
             .ok_or_else(|| GcError::InvalidPrepParams("material size overflows usize".into()))?;
 
-        Ok(PartyNet::new_mesh(party_count)
+        let party_id = session.party_id();
+        let mut rng = AesRng::from_rng(&mut *rng).unwrap();
+        let mut delta = F128b::random(&mut rng);
+        if tweak_delta_lsb && party_id == 0 {
+            let mut buf = delta.to_bytes();
+            buf[0] |= 1;
+            delta = F128b::from_bytes(&buf).unwrap();
+        }
+        let tccr_key = blake3::derive_key("multiparty-gc secure prep tccr key v1", session.sid());
+        Ok(Self {
+            party_id,
+            party_count: session.party_count(),
+            delta,
+            tccr_key: Block::from(u128::from_le_bytes(tccr_key[..16].try_into().unwrap())),
+            session,
+            rng,
+            rho: params.rho,
+            bucket_size,
+            bits_needed: bits,
+            triples_needed: triples,
+            open_delay,
+            prepped: false,
+            auth_bits: VecDeque::new(),
+            triples: VecDeque::new(),
+            #[cfg(test)]
+            cheat: None,
+        })
+    }
+
+    /// Create preprocessors for `party_count` parties in this process that are connected
+    /// with the in-memory transport, see [SecurePreprocessor::new] for the parameters.
+    pub fn new_in_memory<R: Rng + CryptoRng>(
+        rng: &mut R,
+        party_count: u16,
+        tweak_delta_lsb: bool,
+        bits: usize,
+        triples: usize,
+        params: SecurePrepParams,
+        open_delay: Option<Duration>,
+    ) -> Result<Vec<Self>, GcError> {
+        mesh(party_count, LinkModel::default(), NetworkConfig::default())?
             .into_iter()
-            .enumerate()
-            .map(|(party_id, net)| {
-                let mut rng = AesRng::from_rng(&mut *rng).unwrap();
-                let mut delta = F128b::random(&mut rng);
-                if tweak_delta_lsb && party_id == 0 {
-                    let mut buf = delta.to_bytes();
-                    buf[0] |= 1;
-                    delta = F128b::from_bytes(&buf).unwrap();
-                }
-                Self {
-                    party_id: party_id as u16,
-                    party_count,
-                    delta,
-                    net,
+            .map(|net| {
+                let session = net.session("secure prep")?;
+                Self::new(
+                    session,
                     rng,
-                    rho: params.rho,
-                    bucket_size,
-                    bits_needed: bits,
-                    triples_needed: triples,
+                    tweak_delta_lsb,
+                    bits,
+                    triples,
+                    params,
                     open_delay,
-                    prepped: false,
-                    auth_bits: VecDeque::new(),
-                    triples: VecDeque::new(),
-                    #[cfg(test)]
-                    cheat: None,
-                }
+                )
             })
-            .collect())
+            .collect()
     }
 
     #[cfg(test)]
@@ -197,7 +227,11 @@ impl SecurePreprocessor {
 
     fn coin_toss(&mut self) -> Result<[u8; 32], GcError> {
         let bad_opening = self.cheating(Cheat::CoinTossBadOpening);
-        self.net.coin_toss(&mut self.rng, bad_opening)
+        Ok(self.session.coin_with(&mut self.rng, bad_opening)?)
+    }
+
+    fn tccr(&self) -> AesHash {
+        AesHash::new(self.tccr_key)
     }
 }
 
@@ -242,8 +276,8 @@ impl StaticPreprocessor for SecurePreprocessor {
         xs: &[AuthShare<F2, F128b>],
     ) -> Result<Option<Vec<F2>>, GcError> {
         let result = self.open_values_to_inner(receiver_party, xs);
-        if result.is_err() {
-            self.abort();
+        if let Err(err) = &result {
+            self.abort(&format!("opening failed: {err}"));
         }
         result
     }
@@ -254,8 +288,8 @@ impl StaticPreprocessor for SecurePreprocessor {
 }
 
 impl SecurePreprocessor {
-    fn abort(&mut self) {
-        self.net.abort();
+    fn abort(&mut self, reason: &str) {
+        self.session.abort(reason);
         self.prepped = false;
         self.auth_bits.clear();
         self.triples.clear();
@@ -303,10 +337,13 @@ impl SecurePreprocessor {
         if self.cheating(wrong_opening) && !xs.is_empty() {
             my_shares[0] ^= 1;
         }
-        for peer in self.net.peers() {
+        for peer in self.session.peers() {
             if is_receiver(peer) {
-                let digest = mac_digest(xs.iter().map(|x| x.mac_values[peer as usize]));
-                self.net
+                let digest = mac_digest(
+                    self.session.sid(),
+                    xs.iter().map(|x| x.mac_values[peer as usize]),
+                );
+                self.session
                     .send(peer, &[my_shares.as_slice(), &digest].concat())?;
             }
         }
@@ -316,11 +353,12 @@ impl SecurePreprocessor {
 
         let shares_len = xs.len().div_ceil(8);
         let mut output = xs.iter().map(|x| bool::from(x.share)).collect_vec();
-        for peer in self.net.peers() {
-            let msg = self.net.recv_exact(peer, shares_len + blake3::OUT_LEN)?;
+        for peer in self.session.peers() {
+            let msg = self.session.recv(peer, shares_len + blake3::OUT_LEN)?;
             let (shares, digest) = msg.split_at(shares_len);
             let shares = unpack_bits(shares, xs.len());
             let expected = mac_digest(
+                self.session.sid(),
                 xs.iter()
                     .zip(&shares)
                     .map(|(x, s)| x.mac_keys[peer as usize] + mul_bit(*s, self.delta)),
@@ -360,28 +398,37 @@ impl SecurePreprocessor {
 impl Preprocessor for SecurePreprocessor {
     fn prep(&mut self) -> Result<(), GcError> {
         let result = self.prep_inner();
-        if result.is_err() {
+        if let Err(err) = &result {
             // close all links so that the other parties abort instead of blocking
-            self.abort();
+            self.abort(&format!("preprocessing failed: {err}"));
         }
         result
     }
 }
 
 /// Tweakable circular correlation robust hash, the tweak is unique for every
-/// `(domain, index, from, to, bit)`.
-fn hash(x: F128b, domain: HashDomain, index: usize, from: u16, to: u16, bit: bool) -> F128b {
+/// `(domain, index, from, to, bit)` and the key is unique per session.
+fn hash(
+    tccr: &AesHash,
+    x: F128b,
+    domain: HashDomain,
+    index: usize,
+    from: u16,
+    to: u16,
+    bit: bool,
+) -> F128b {
     let tweak = ((index as u128) << 64)
         | ((from as u128) << 48)
         | ((to as u128) << 32)
         | ((domain as u128) << 8)
         | bit as u128;
-    block_to_f128b(AES_HASH.tccr_hash(Block::from(tweak), f128b_to_block(x)))
+    block_to_f128b(tccr.tccr_hash(Block::from(tweak), f128b_to_block(x)))
 }
 
-fn mac_digest(macs: impl Iterator<Item = F128b>) -> [u8; blake3::OUT_LEN] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"OPEN_MACS");
+/// Digest of the MACs of opened shares, bound to the session.
+fn mac_digest(sid: &[u8; 32], macs: impl Iterator<Item = F128b>) -> [u8; blake3::OUT_LEN] {
+    let mut hasher = blake3::Hasher::new_derive_key("multiparty-gc opening macs v1");
+    hasher.update(sid);
     for mac in macs {
         hasher.update(&mac.to_bytes());
     }

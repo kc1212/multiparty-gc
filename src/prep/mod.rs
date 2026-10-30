@@ -7,7 +7,6 @@ use crate::error::GcError;
 use crate::sharing::AuthShare;
 
 pub mod insecure;
-mod network;
 pub mod secure;
 
 pub use insecure::InsecureBenchPreprocessor;

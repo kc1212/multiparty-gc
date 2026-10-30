@@ -7,10 +7,7 @@ use super::{
     Cheat, F128B_LEN, HashDomain, SecurePreprocessor, bytes_to_f128b, f128b_to_bytes, hash, lsb,
     mul_bit, pack_bits, seed_to_block, unpack_bits,
 };
-use crate::prep::{
-    ReceiverParty, StaticPreprocessor, Triple,
-    network::{COMMITMENT_LEN, NONCE_LEN, commit, verify_commitment},
-};
+use crate::prep::{ReceiverParty, StaticPreprocessor, Triple};
 use crate::{error::GcError, sharing::AuthShare, universal_hash};
 
 impl SecurePreprocessor {
@@ -26,7 +23,8 @@ impl SecurePreprocessor {
         let n = self.party_count as usize;
         let delta = self.delta;
         let victim = self.victim();
-        let peers = self.net.peers().collect_vec();
+        let peers = self.session.peers().collect_vec();
+        let tccr = self.tccr();
         let count = shares.len() / 3;
         let (xs, ys, rs): (Vec<_>, Vec<_>, Vec<_>) = shares.into_iter().tuples().multiunzip();
         let x_bit = |t: usize| bool::from(xs[t].share);
@@ -43,18 +41,30 @@ impl SecurePreprocessor {
                 vs[t] ^= s;
                 let key = x.mac_keys[j as usize];
                 let y = bool::from(y.share) ^ (flip_y && j == victim);
-                h0.push(lsb(hash(key, HashDomain::HalfAnd, t, me, j, false)) ^ s);
-                h1.push(lsb(hash(key + delta, HashDomain::HalfAnd, t, me, j, true)) ^ s ^ y);
+                h0.push(lsb(hash(&tccr, key, HashDomain::HalfAnd, t, me, j, false)) ^ s);
+                h1.push(
+                    lsb(hash(
+                        &tccr,
+                        key + delta,
+                        HashDomain::HalfAnd,
+                        t,
+                        me,
+                        j,
+                        true,
+                    )) ^ s
+                        ^ y,
+                );
             }
             msgs[j as usize] = pack_bits(h0.into_iter().chain(h1));
         }
-        let received = self.net.exchange(&msgs, (2 * count).div_ceil(8))?;
+        let received = self.session.exchange(&msgs, (2 * count).div_ceil(8))?;
         for &i in &peers {
             let h = unpack_bits(&received[i as usize], 2 * count);
             for (t, v) in vs.iter_mut().enumerate() {
                 let x = x_bit(t);
                 let mac = xs[t].mac_values[i as usize];
-                *v ^= h[t + count * x as usize] ^ lsb(hash(mac, HashDomain::HalfAnd, t, i, me, x));
+                *v ^= h[t + count * x as usize]
+                    ^ lsb(hash(&tccr, mac, HashDomain::HalfAnd, t, i, me, x));
             }
         }
 
@@ -66,23 +76,18 @@ impl SecurePreprocessor {
         if self.cheating(Cheat::LeakyAndFlipE) {
             my_e[0] ^= 1;
         }
-        let e_len = my_e.len();
         let all_e = if self.cheating(Cheat::EquivocateBroadcast) {
             let mut other_e = my_e.clone();
             other_e[0] ^= 1;
-            self.net.broadcast_with(
-                &my_e,
-                |j| {
-                    if j == victim {
-                        other_e.clone()
-                    } else {
-                        my_e.clone()
-                    }
-                },
-                e_len,
-            )?
+            self.session.broadcast_all_with(&my_e, |j| {
+                if j == victim {
+                    other_e.clone()
+                } else {
+                    my_e.clone()
+                }
+            })?
         } else {
-            self.net.broadcast(&my_e, e_len)?
+            self.session.broadcast_all(&my_e)?
         };
         let mut zs = rs;
         for (i, e) in all_e.iter().enumerate() {
@@ -112,9 +117,10 @@ impl SecurePreprocessor {
                 .enumerate()
                 .map(|(t, (x, phi))| {
                     let key = x.mac_keys[j as usize];
-                    let k_phi = hash(key, HashDomain::LeakyAnd, t, me, j, false);
-                    let mut u =
-                        hash(key + delta, HashDomain::LeakyAnd, t, me, j, true) + k_phi + *phi;
+                    let k_phi = hash(&tccr, key, HashDomain::LeakyAnd, t, me, j, false);
+                    let mut u = hash(&tccr, key + delta, HashDomain::LeakyAnd, t, me, j, true)
+                        + k_phi
+                        + *phi;
                     if wrong_u && j == victim {
                         u += F128b::ONE;
                     }
@@ -124,7 +130,7 @@ impl SecurePreprocessor {
             key_phis[j as usize] = k_phis;
             msgs[j as usize] = f128b_to_bytes(&us);
         }
-        let received = self.net.exchange(&msgs, count * F128B_LEN)?;
+        let received = self.session.exchange(&msgs, count * F128B_LEN)?;
         let mut hs = izip!(&xs, &zs, &phis)
             .map(|(x, z, phi)| {
                 mul_bit(bool::from(x.share), *phi)
@@ -138,7 +144,7 @@ impl SecurePreprocessor {
             for (t, (h, u)) in hs.iter_mut().zip(us).enumerate() {
                 let x = x_bit(t);
                 let mac = xs[t].mac_values[k as usize];
-                let m_phi = mul_bit(x, u) + hash(mac, HashDomain::LeakyAnd, t, k, me, x);
+                let m_phi = mul_bit(x, u) + hash(&tccr, mac, HashDomain::LeakyAnd, t, k, me, x);
                 *h += key_phis[k as usize][t] + m_phi;
             }
         }
@@ -149,14 +155,14 @@ impl SecurePreprocessor {
         if self.cheating(Cheat::LeakyAndWrongH) {
             h += F128b::ONE;
         }
-        let (com, nonce) = commit(&mut self.rng, &h.to_bytes());
-        let coms = self.net.broadcast(&com, COMMITMENT_LEN)?;
+        let (com, nonce) = self.session.commit(&mut self.rng, &h.to_bytes());
+        let coms = self.session.broadcast_all(&com)?;
         let opening = h.to_bytes().into_iter().chain(nonce).collect_vec();
-        let openings = self.net.broadcast(&opening, F128B_LEN + NONCE_LEN)?;
+        let openings = self.session.broadcast_all(&opening)?;
         let mut sum = F128b::ZERO;
         for (i, (com, opening)) in coms.iter().zip(&openings).enumerate() {
             let (h, nonce) = opening.split_at(F128B_LEN);
-            if !verify_commitment(com, h, nonce) {
+            if !self.session.verify_commitment(com, h, nonce) {
                 self.detected(GcError::CheatDetected(format!(
                     "party {i} opened the AND triple check commitment incorrectly"
                 )))?;
