@@ -117,6 +117,11 @@ impl Session {
         self.stream
     }
 
+    /// Communication of the root session of this session and all its children.
+    pub fn stats(&self) -> super::Stats {
+        self.stats.snapshot()
+    }
+
     /// Create a sub-session, each label can only be used once per session.
     pub fn child(&self, label: &str) -> Result<Session, NetError> {
         Session::new(
@@ -237,6 +242,15 @@ impl Session {
             hasher.update(m);
         }
         self.echo(hasher)?;
+        Ok(received)
+    }
+
+    /// Send `msg` to every peer and receive a message of the same length from every peer,
+    /// without an echo round. The output is indexed by party and includes our own message.
+    fn send_to_all_inner(&self, msg: &[u8]) -> Result<Vec<Vec<u8>>, NetError> {
+        let to_send = vec![msg.to_vec(); self.party_count() as usize];
+        let mut received = self.exchange_inner(&to_send, msg.len())?;
+        received[self.party_id() as usize] = msg.to_vec();
         Ok(received)
     }
 
@@ -365,7 +379,8 @@ impl Session {
             seed[0] ^= 1;
         }
         let opening = [seed.as_slice(), nonce.as_slice()].concat();
-        let openings = self.broadcast_all_inner(&opening, |_| opening.clone())?;
+        // the commitments were broadcast, so an equivocating opening is caught below
+        let openings = self.send_to_all_inner(&opening)?;
 
         let mut hasher = blake3::Hasher::new_derive_key("multiparty-gc coin toss v1");
         hasher.update(&self.sid);
@@ -430,19 +445,6 @@ impl Session {
         self.check(result)
     }
 
-    /// Typed version of [Self::broadcast_all_with], only useful in tests.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn broadcast_all_msg_with<T: Wire>(
-        &mut self,
-        msg: &T,
-        msg_for: impl Fn(PartyId) -> T,
-        shape: &T::Shape,
-    ) -> Result<Vec<T>, NetError> {
-        let bytes = msg.to_wire_bytes();
-        let result = self.broadcast_all_typed(&bytes, |j| msg_for(j).to_wire_bytes(), shape);
-        self.check(result)
-    }
-
     fn broadcast_all_typed<T: Wire>(
         &mut self,
         bytes: &[u8],
@@ -458,6 +460,132 @@ impl Session {
             .into_iter()
             .map(|x| x.expect("all messages are present"))
             .collect())
+    }
+
+    /// Every party sends the same message to all peers **without** an echo round.
+    /// The output is indexed by party and includes our own message.
+    ///
+    /// Unlike [Self::broadcast_all_msg], a party can send different messages to different
+    /// peers without being noticed here. Only use this when the receivers check the
+    /// messages against values that were broadcast, e.g., to open broadcast commitments:
+    /// an equivocating party then fails that check (commitments are binding).
+    pub fn send_to_all_msg<T: Wire>(
+        &mut self,
+        msg: &T,
+        shape: &T::Shape,
+    ) -> Result<Vec<T>, NetError> {
+        let bytes = msg.to_wire_bytes();
+        let result = if bytes.len() != T::encoded_len(shape) {
+            Err(NetError::Config("message does not match its shape".into()))
+        } else {
+            self.send_to_all_inner(&bytes).and_then(|received| {
+                Ok(self
+                    .decode_all(received, shape, true)?
+                    .into_iter()
+                    .map(|x| x.expect("all messages are present"))
+                    .collect())
+            })
+        };
+        self.check(result)
+    }
+
+    /// Every party broadcasts `public` and, in the same round, sends `private_for(j)`
+    /// to every peer `j`. Only the public parts are checked with an echo round, so this
+    /// takes two rounds instead of three for a broadcast followed by an exchange.
+    /// The public output includes our own message.
+    pub fn broadcast_all_with_private_msg<B: Wire, P: Wire>(
+        &mut self,
+        public: &B,
+        private_for: impl FnMut(PartyId) -> P,
+        public_shape: &B::Shape,
+        private_shape: &P::Shape,
+    ) -> Result<(Vec<B>, PerParty<P>), NetError> {
+        let public_bytes = public.to_wire_bytes();
+        let result = self.broadcast_all_with_private_inner(
+            &public_bytes,
+            |_| public_bytes.clone(),
+            private_for,
+            public_shape,
+            private_shape,
+        );
+        self.check(result)
+    }
+
+    /// Same as [Self::broadcast_all_with_private_msg] but `public_for(j)` is sent to
+    /// party `j`. This is only useful to simulate an equivocating party in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn broadcast_all_with_private_msg_with<B: Wire, P: Wire>(
+        &mut self,
+        public: &B,
+        public_for: impl Fn(PartyId) -> B,
+        private_for: impl FnMut(PartyId) -> P,
+        public_shape: &B::Shape,
+        private_shape: &P::Shape,
+    ) -> Result<(Vec<B>, PerParty<P>), NetError> {
+        let public_bytes = public.to_wire_bytes();
+        let result = self.broadcast_all_with_private_inner(
+            &public_bytes,
+            |j| public_for(j).to_wire_bytes(),
+            private_for,
+            public_shape,
+            private_shape,
+        );
+        self.check(result)
+    }
+
+    fn broadcast_all_with_private_inner<B: Wire, P: Wire>(
+        &mut self,
+        public: &[u8],
+        public_for: impl Fn(PartyId) -> Vec<u8>,
+        mut private_for: impl FnMut(PartyId) -> P,
+        public_shape: &B::Shape,
+        private_shape: &P::Shape,
+    ) -> Result<(Vec<B>, PerParty<P>), NetError> {
+        let public_len = B::encoded_len(public_shape);
+        if public.len() != public_len {
+            return Err(NetError::Config("message does not match its shape".into()));
+        }
+        let me = self.party_id();
+        let msgs = (0..self.party_count())
+            .map(|j| {
+                if j == me {
+                    vec![]
+                } else {
+                    [public_for(j), private_for(j).to_wire_bytes()].concat()
+                }
+            })
+            .collect::<Vec<_>>();
+        let received = self.exchange_inner(
+            &msgs,
+            public_len.saturating_add(P::encoded_len(private_shape)),
+        )?;
+
+        let mut publics = Vec::with_capacity(received.len());
+        let mut privates = Vec::with_capacity(received.len());
+        for (j, msg) in received.into_iter().enumerate() {
+            if j == me as usize {
+                publics.push(public.to_vec());
+                privates.push(None);
+            } else {
+                let (public, private) = msg.split_at(public_len);
+                publics.push(public.to_vec());
+                privates.push(Some(decode_from(j as PartyId, private, private_shape)?));
+            }
+        }
+
+        // only the public parts must be the same for everyone
+        let mut hasher = self.echo_hasher(b"all");
+        for m in &publics {
+            hasher.update(m);
+        }
+        self.echo(hasher)?;
+
+        let publics = publics
+            .iter()
+            .enumerate()
+            .map(|(j, bytes)| decode_from(j as PartyId, bytes, public_shape))
+            .collect::<Result<_, _>>()?;
+        Ok((publics, PerParty::new(me, privates)))
     }
 
     /// Typed version of [Self::broadcast_from].
@@ -564,6 +692,12 @@ impl AbstractChannel for ByteChannel {
                     .map_err(|err| self.io_error(err))?;
                 self.read_pos = 0;
                 self.stats.record_recv(self.read_buf.len());
+                if self.read_buf.is_empty() {
+                    return Err(self.io_error(NetError::Malformed {
+                        party: self.peer,
+                        reason: "empty byte-channel frame".into(),
+                    }));
+                }
             }
             let n = (bytes.len() - filled).min(self.read_buf.len() - self.read_pos);
             bytes[filled..filled + n]

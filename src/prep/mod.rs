@@ -61,8 +61,11 @@ pub trait StaticPreprocessor {
             })
             .unzip();
 
-        let ds = self.open_values_to(ReceiverParty::All, &shares_d)?.unwrap();
-        let es = self.open_values_to(ReceiverParty::All, &shares_e)?.unwrap();
+        // open d and e together, this takes one round instead of two
+        let mut ds = self
+            .open_values_to(ReceiverParty::All, &[shares_d, shares_e].concat())?
+            .ok_or_else(|| GcError::WrongOpening("opening to all returned nothing".into()))?;
+        let es = ds.split_off(indices.len());
 
         // z = d * [y] + [a] * e + [c]
         Ok(izip!(indices, ds, es, beaver_triples)

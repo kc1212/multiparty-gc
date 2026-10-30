@@ -169,10 +169,13 @@ impl SecurePreprocessor {
         }
 
         let combined_bits = Bits((0..rho).map(|j| (combined_bits >> j) & 1 == 1).collect());
-        let all_bits = self.session.broadcast_all_msg(&combined_bits, &rho)?;
-        let received = self
-            .session
-            .exchange_msg(|k| combined_macs[k as usize].clone(), &(rho, ()))?;
+        // broadcast the combined bits and send the combined MACs in the same round
+        let (all_bits, received) = self.session.broadcast_all_with_private_msg(
+            &combined_bits,
+            |k| std::mem::take(&mut combined_macs[k as usize]),
+            &rho,
+            &(rho, ()),
+        )?;
         for (i, their_macs) in received.iter() {
             let i = i as usize;
             for (j, mac) in their_macs.iter().enumerate() {
@@ -216,9 +219,10 @@ impl SecurePreprocessor {
         let coms = self
             .session
             .broadcast_all_msg(&my_coms, &(count, ((), (), ())))?;
+        // the commitments were broadcast, so the openings need no echo round
         let mac_openings = self
             .session
-            .broadcast_all_msg(&my_mac_openings, &(count, (((), (n, ())), ())))?;
+            .send_to_all_msg(&my_mac_openings, &(count, (((), (n, ())), ())))?;
 
         // bits[i][r] and macs[i][r][k] = M_k[x^i_r]
         let mut bits = vec![vec![false; count]; n];
@@ -249,7 +253,7 @@ impl SecurePreprocessor {
             .collect_vec();
         let all_key_openings = self
             .session
-            .broadcast_all_msg(&my_key_openings, &(count, ((), ())))?;
+            .send_to_all_msg(&my_key_openings, &(count, ((), ())))?;
 
         for i in self.session.peers().map(|p| p as usize) {
             for (r, (key, nonce)) in all_key_openings[i].iter().enumerate() {

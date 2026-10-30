@@ -61,6 +61,9 @@ cargo run --release -- -n 3 -p copz -c aes128 --prep secure \
 Each line of `parties.conf` is `<party id> <address> <certificate file>`. In
 this mode `prep_bytes` and `online_bytes` only count the evaluator's traffic.
 
+On Unix, generated key files are owner-readable/writable only, and new configuration
+directories are private. The generator refuses to overwrite existing identities.
+
 The CSV output reports `prep_duration` (the function-independent
 preprocessing, not part of `total_duration`), and the bytes sent by all
 parties on the preprocessing session (`prep_bytes`, which includes the

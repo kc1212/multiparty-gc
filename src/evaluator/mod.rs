@@ -2,20 +2,21 @@ use bristol_fashion::Circuit;
 use scuttlebutt::field::FiniteField;
 use swanky_field_binary::F2;
 
-use crate::{ExtractOutputMsg1, OutputMsg1, OutputMsg2, error::GcError, garbler::Garbling};
+use crate::{ExtractOutputMsg1, OutputMsg1, OutputMsg2, error::GcError};
 
 pub mod copz;
 pub mod wrk17;
 
 pub trait Evaluator {
-    type Gc: Garbling;
+    type Gc;
+    type State;
     type OM1: OutputMsg1;
     type OM2: OutputMsg2;
     type Label: FiniteField;
     type GarbledOutput: ExtractOutputMsg1;
     type Decoder;
 
-    fn from_garbling(garbling: Self::Gc) -> Self;
+    fn from_state(garbling: Self::State) -> Self;
 
     fn eval(
         &self,

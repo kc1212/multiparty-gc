@@ -17,7 +17,7 @@ use crate::{
     evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
     full_simulation,
     garbler::{copz::CopzGarbler, wrk17::Wrk17Garbler},
-    prep::{SecurePrepParams, SecurePreprocessor, run_prep, secure::Cheat},
+    prep::{Preprocessor, SecurePrepParams, SecurePreprocessor, run_prep, secure::Cheat},
 };
 
 fn localhost() -> SocketAddr {
@@ -214,6 +214,35 @@ fn secure_quic_parties(
         preps.push(prep);
         rest.push((net.session("online")?, net));
     }
+    if let Some((cheater, cheat)) = cheat {
+        let results = std::thread::scope(|scope| {
+            let handles = preps
+                .iter_mut()
+                .map(|prep| scope.spawn(|| prep.prep()))
+                .collect_vec();
+            handles.into_iter().map(|h| h.join().unwrap()).collect_vec()
+        });
+        for (i, result) in results.iter().enumerate() {
+            if i != cheater {
+                assert!(result.is_err(), "honest party {i} accepted {cheat:?}");
+            }
+        }
+        // Abort delivery can race another honest party's local check. Observe every
+        // outcome, rather than assuming party 0 is the first to detect the attack.
+        let detected = results
+            .into_iter()
+            .enumerate()
+            .find_map(|(i, result)| match result {
+                Err(err @ GcError::CheatDetected(_)) | Err(err @ GcError::MacCheckFailure)
+                    if i != cheater =>
+                {
+                    Some(err)
+                }
+                _ => None,
+            })
+            .expect("an honest party must detect the attack");
+        return Err(detected);
+    }
     let preps = run_prep(preps)?;
     Ok(preps
         .into_iter()
@@ -261,7 +290,6 @@ fn test_quic_full_protocol() {
 #[test]
 fn test_quic_cheating_is_detected() {
     let circuit = NamedCircuit::from_path("circuits/and2.txt");
-    // run_prep returns the first error, which is from an honest party here
     for cheat in [Cheat::EquivocateBroadcast, Cheat::LeakyAndFlipE] {
         let result = secure_quic_parties(&circuit, 3, Some((1, cheat)));
         assert!(
@@ -269,4 +297,33 @@ fn test_quic_cheating_is_detected() {
             "{cheat:?}"
         );
     }
+}
+
+#[test]
+fn test_quic_many_sessions_and_out_of_order_reads() {
+    let config = QuicConfig {
+        network: super::NetworkConfig {
+            timeout: Duration::from_secs(3),
+        },
+        close_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let nets = quic_mesh_with(2, config, |_, certs| certs.to_vec())
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    run_all(nets, |net| {
+        let peer = 1 - net.party_id();
+        for i in 0..300 {
+            let mut s = net.session(&format!("session {i}")).unwrap();
+            s.send(peer, &[7]).unwrap();
+            assert_eq!(s.recv(peer, 1).unwrap(), vec![7]);
+        }
+        let mut a = net.session("a").unwrap();
+        let mut b = net.session("b").unwrap();
+        b.send(peer, b"b").unwrap();
+        a.send(peer, b"a").unwrap();
+        assert_eq!(a.recv(peer, 1).unwrap(), b"a");
+        assert_eq!(b.recv(peer, 1).unwrap(), b"b");
+    });
 }

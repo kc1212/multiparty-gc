@@ -4,7 +4,7 @@ use scuttlebutt::{AesRng, ring::FiniteRing};
 use swanky_field_binary::{F2, F128b};
 
 use super::{Cheat, HashDomain, SecurePreprocessor, hash, lsb, mul_bit, seed_to_block};
-use crate::net::{Bits, Wire};
+use crate::net::{Bits, PartyId, Wire};
 use crate::prep::{ReceiverParty, StaticPreprocessor, Triple};
 use crate::{error::GcError, sharing::AuthShare, universal_hash};
 
@@ -68,7 +68,7 @@ impl SecurePreprocessor {
             }
         }
 
-        // z^i = x^i y^i + v^i, broadcast e^i = z^i + r^i and set [z^i] = [r^i] + e^i
+        // z^i = x^i y^i + v^i and e^i = z^i + r^i
         let es = izip!(&xs, &ys, &rs, &vs)
             .map(|(x, y, r, v)| bool::from(x.share * y.share + r.share) ^ v)
             .collect_vec();
@@ -76,37 +76,9 @@ impl SecurePreprocessor {
         if self.cheating(Cheat::LeakyAndFlipE) {
             my_e.0[0] ^= true;
         }
-        let all_e = if self.cheating(Cheat::EquivocateBroadcast) {
-            let mut other_e = my_e.clone();
-            other_e.0[0] ^= true;
-            self.session.broadcast_all_msg_with(
-                &my_e,
-                |j| {
-                    if j == victim {
-                        other_e.clone()
-                    } else {
-                        my_e.clone()
-                    }
-                },
-                &count,
-            )?
-        } else {
-            self.session.broadcast_all_msg(&my_e, &count)?
-        };
-        let mut zs = rs;
-        for (i, e) in all_e.iter().enumerate() {
-            for (z, e) in zs.iter_mut().zip(&e.0) {
-                if *e {
-                    if i == me as usize {
-                        z.share += F2::ONE;
-                    } else {
-                        z.mac_keys[i] += delta;
-                    }
-                }
-            }
-        }
 
-        // Check the triples, Phi_i is the share of y * (sum_i Delta_i)
+        // Phi_i is the share of y * (sum_i Delta_i), U does not depend on e so it is
+        // sent in the same round as e
         let phis = ys
             .iter()
             .map(|y| mul_bit(bool::from(y.share), delta) + y.sum_mac_keys() + y.sum_mac_values())
@@ -134,9 +106,44 @@ impl SecurePreprocessor {
             key_phis[j as usize] = k_phis;
             u_msgs[j as usize] = us;
         }
-        let received = self
-            .session
-            .exchange_msg(|j| std::mem::take(&mut u_msgs[j as usize]), &(count, ()))?;
+
+        // broadcast e^i and send U_{i,j} to every P_j
+        let u_for = |j: PartyId| std::mem::take(&mut u_msgs[j as usize]);
+        let (all_e, received) = if self.cheating(Cheat::EquivocateBroadcast) {
+            let mut other_e = my_e.clone();
+            other_e.0[0] ^= true;
+            self.session.broadcast_all_with_private_msg_with(
+                &my_e,
+                |j| {
+                    if j == victim {
+                        other_e.clone()
+                    } else {
+                        my_e.clone()
+                    }
+                },
+                u_for,
+                &count,
+                &(count, ()),
+            )?
+        } else {
+            self.session
+                .broadcast_all_with_private_msg(&my_e, u_for, &count, &(count, ()))?
+        };
+
+        // set [z^i] = [r^i] + e^i
+        let mut zs = rs;
+        for (i, e) in all_e.iter().enumerate() {
+            for (z, e) in zs.iter_mut().zip(&e.0) {
+                if *e {
+                    if i == me as usize {
+                        z.share += F2::ONE;
+                    } else {
+                        z.mac_keys[i] += delta;
+                    }
+                }
+            }
+        }
+
         let mut hs = izip!(&xs, &zs, &phis)
             .map(|(x, z, phi)| {
                 mul_bit(bool::from(x.share), *phi)
@@ -162,7 +169,8 @@ impl SecurePreprocessor {
         }
         let (com, nonce) = self.session.commit(&mut self.rng, &h.to_wire_bytes());
         let coms = self.session.broadcast_all_msg(&com, &())?;
-        let openings = self.session.broadcast_all_msg(&(h, nonce), &((), ()))?;
+        // the commitments were broadcast, so the openings need no echo round
+        let openings = self.session.send_to_all_msg(&(h, nonce), &((), ()))?;
         let mut sum = F128b::ZERO;
         for (i, (com, (h, nonce))) in coms.iter().zip(&openings).enumerate() {
             if !self

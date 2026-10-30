@@ -39,6 +39,7 @@ impl ExtractOutputMsg1 for Wrk17EncodedOutput {
 
 impl Evaluator for Wrk17Evaluator {
     type Gc = Wrk17Garbling;
+    type State = Wrk17EvaluatorOutput;
     type Label = F128b;
     type GarbledOutput = Wrk17EncodedOutput;
     type OM1 = DummyOutput;
@@ -49,13 +50,13 @@ impl Evaluator for Wrk17Evaluator {
     // inner[i][j] is the ith wire and jth party
     type Decoder = Vec<(F2, F128b)>;
 
-    fn from_garbling(garbling: Wrk17Garbling) -> Self {
+    fn from_state(state: Wrk17EvaluatorOutput) -> Self {
         let Wrk17EvaluatorOutput {
             total_num_parties,
             garbling_shares,
             wire_mask_shares,
             delta,
-        } = garbling.get_evaluator_gates();
+        } = state;
 
         Self {
             num_parties: total_num_parties,
@@ -99,7 +100,7 @@ impl Evaluator for Wrk17Evaluator {
         let garblings = transpose(
             garblings
                 .into_iter()
-                .map(|garbling| garbling.get_garbler_gates())
+                .map(|garbling| garbling.0)
                 .collect_vec(),
         );
 

@@ -56,6 +56,7 @@ impl ExtractOutputMsg1 for CopzEncodedOutput {
 
 impl Evaluator for CopzEvaluator {
     type Gc = CopzGarbling;
+    type State = CopzEvaluatorOutput;
     type Label = F128b;
     type GarbledOutput = CopzEncodedOutput;
     type OM1 = CopzOutputMsg1;
@@ -64,13 +65,13 @@ impl Evaluator for CopzEvaluator {
     // To decode, each party needs to send the output wire masks.
     type Decoder = Vec<F2>;
 
-    fn from_garbling(garbling: CopzGarbling) -> Self {
+    fn from_state(state: CopzEvaluatorOutput) -> Self {
         let CopzEvaluatorOutput {
             num_parties: total_num_parties,
             garbling_shares,
             wire_mask_shares,
             delta,
-        } = garbling.into_evaluator_gates();
+        } = state;
         Self {
             num_parties: total_num_parties,
             garbling_shares,
@@ -109,14 +110,18 @@ impl Evaluator for CopzEvaluator {
 
         // Received from the first garbler,
         // which are values b_w = lsb(k^2_{w,0}).
-        let b_ws = garblings[0].get_b_w();
+        let b_ws = garblings[0]
+            .b_w
+            .as_ref()
+            .ok_or_else(|| GcError::UnexpectedMessageType("party 0 did not supply b_w".into()))?
+            .clone();
 
         // We iterate over the gates, so we need to transpose `garblings`
         // since we need the garbled gates from all parties to evaluate one gate.
         let garblings = transpose(
             garblings
                 .into_iter()
-                .map(|garbling| garbling.into_garbler_gates())
+                .map(|garbling| garbling.gates)
                 .collect_vec(),
         );
 

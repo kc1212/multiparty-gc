@@ -13,18 +13,13 @@ use smallvec::smallvec;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    DummyOutput, InputMsg1, InputMsg2, InputMsg3, MsgShape,
-    error::GcError,
-    garbler::auth_bits_from_prep,
-    net::{
-        Bits, Wire,
-        wire::{Reader, WireError},
-    },
-    prep::Preprocessor,
-    sharing::AuthShare,
+    DummyOutput, InputMsg1, InputMsg2, InputMsg3, error::GcError, garbler::auth_bits_from_prep,
+    prep::Preprocessor, sharing::AuthShare,
 };
 
-use super::{Garbler, Garbling, process_linear_gates};
+use super::{GarbleOutput, Garbler, process_linear_gates};
+
+mod wire;
 
 /// Garbler for WRK17. Due to the way parties are indexed,
 /// we set the last party (n-1) as the evaluator instead of the first.
@@ -319,6 +314,12 @@ pub(crate) fn decrypt_garbled_gate(
     Ok((output_mask, output_label))
 }
 
+/// Private evaluator state has no network encoding.
+/// ```compile_fail
+/// use multiparty_gc::{garbler::wrk17::Wrk17EvaluatorOutput, net::Wire};
+/// fn requires_wire<T: Wire>() {}
+/// requires_wire::<Wrk17EvaluatorOutput>();
+/// ```
 pub struct Wrk17EvaluatorOutput {
     pub(crate) total_num_parties: u16,
     pub(crate) garbling_shares: Vec<[AuthShare<F2, F128b>; 4]>,
@@ -327,38 +328,8 @@ pub struct Wrk17EvaluatorOutput {
     pub(crate) delta: F128b,
 }
 
-pub enum Wrk17Garbling {
-    // the index (starting from 0) should correspond to the party_id
-    // the length should be exactly n-1
-    // party_id = n-1 is the evaluator
-    Garbler(Vec<Wrk17GarbledGate>),
-    Evaluator(Wrk17EvaluatorOutput),
-}
-
-impl Garbling for Wrk17Garbling {
-    fn estimate_size(&self) -> usize {
-        match self {
-            Wrk17Garbling::Garbler(gates) => gates.iter().map(|g| g.len()).sum::<usize>(),
-            Wrk17Garbling::Evaluator(_) => 0,
-        }
-    }
-}
-
-impl Wrk17Garbling {
-    pub fn get_garbler_gates(self) -> Vec<Wrk17GarbledGate> {
-        match self {
-            Wrk17Garbling::Garbler(inner) => inner,
-            Wrk17Garbling::Evaluator(_) => panic!("not a garbler"),
-        }
-    }
-
-    pub fn get_evaluator_gates(self) -> Wrk17EvaluatorOutput {
-        match self {
-            Wrk17Garbling::Garbler(_) => panic!("not an evaluator"),
-            Wrk17Garbling::Evaluator(inner) => inner,
-        }
-    }
-}
+/// The garbling transmitted to the evaluator; it contains no evaluator secrets.
+pub struct Wrk17Garbling(pub(crate) Vec<Wrk17GarbledGate>);
 
 pub struct Wrk17InputMsg1 {
     shares: Vec<F2>,
@@ -393,6 +364,7 @@ impl InputMsg3 for Wrk17InputMsg3 {
 
 impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
     type Gc = Wrk17Garbling;
+    type EvaluatorState = Wrk17EvaluatorOutput;
     type IM1 = Wrk17InputMsg1;
     type IM2 = Wrk17InputMsg2;
     type IM3 = Wrk17InputMsg3;
@@ -409,7 +381,11 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
     const OUTPUT_CHECK: bool = false;
 
-    fn garble<R>(&mut self, rng: &mut R, circuit: &Circuit) -> Result<Wrk17Garbling, GcError>
+    fn garble<R>(
+        &mut self,
+        rng: &mut R,
+        circuit: &Circuit,
+    ) -> Result<GarbleOutput<Wrk17Garbling, Wrk17EvaluatorOutput>, GcError>
     where
         R: Rng + CryptoRng,
     {
@@ -584,10 +560,10 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
         if self.is_garbler() {
             // Keep some information for the output decoder
-            Ok(Wrk17Garbling::Garbler(garbler_output))
+            Ok(GarbleOutput::Garbler(Wrk17Garbling(garbler_output)))
         } else {
             debug_assert_eq!(nwires as usize, auth_bits.len());
-            Ok(Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
+            Ok(GarbleOutput::Evaluator(Wrk17EvaluatorOutput {
                 total_num_parties: self.num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
@@ -612,7 +588,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         &self,
         true_inputs: &[F2],
         msgs: Vec<Wrk17InputMsg1>,
-    ) -> Result<Vec<Wrk17InputMsg2>, GcError> {
+    ) -> Result<Wrk17InputMsg2, GcError> {
         debug_assert_eq!(self.party_id, self.num_parties - 1);
 
         #[cfg(test)]
@@ -644,11 +620,9 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         #[cfg(test)]
         println!("Masked inputs: {output:?}");
 
-        Ok((0..self.num_parties)
-            .map(|_| Wrk17InputMsg2 {
-                masked_inputs: output.clone(),
-            })
-            .collect())
+        Ok(Wrk17InputMsg2 {
+            masked_inputs: output,
+        })
     }
 
     /// We receive the masked input x^1_w + \lambda_w,
@@ -679,121 +653,6 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         _circuit: &Circuit,
     ) -> Result<Self::OM2, GcError> {
         Ok(DummyOutput)
-    }
-}
-
-/// Length of an encrypted row: the share, the MACs for the other parties and the label.
-fn wrk17_row_len(party_count: u16) -> usize {
-    1 + 16 * (party_count as usize - 1) + 16
-}
-
-/// Only the garblers send their garbling, decoding always returns [Wrk17Garbling::Garbler]
-/// and the gates belong to `shape.sender`.
-impl Wire for Wrk17Garbling {
-    type Shape = MsgShape;
-
-    fn encoded_len(shape: &MsgShape) -> usize {
-        shape
-            .and_gates
-            .saturating_mul(4 * wrk17_row_len(shape.party_count))
-    }
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        match self {
-            Wrk17Garbling::Garbler(gates) => {
-                for gate in gates {
-                    for row in &gate.rows {
-                        out.extend_from_slice(&row.inner);
-                    }
-                }
-            }
-            Wrk17Garbling::Evaluator(_) => panic!("the evaluator's garbling is never sent"),
-        }
-    }
-
-    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
-        let row_len = wrk17_row_len(shape.party_count);
-        let gates = (0..shape.and_gates)
-            .map(|_| {
-                let mut row = || -> Result<_, WireError> {
-                    Ok(Wrk17GarbledRow {
-                        inner: reader.take(row_len)?.to_vec(),
-                    })
-                };
-                Ok(Wrk17GarbledGate {
-                    party_id: shape.sender,
-                    rows: [row()?, row()?, row()?, row()?],
-                })
-            })
-            .collect::<Result<_, WireError>>()?;
-        Ok(Wrk17Garbling::Garbler(gates))
-    }
-}
-
-impl Wire for Wrk17InputMsg1 {
-    type Shape = MsgShape;
-
-    fn encoded_len(shape: &MsgShape) -> usize {
-        <(Bits, Vec<F128b>)>::encoded_len(&(shape.inputs, (shape.inputs, ())))
-    }
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        Bits::from_f2(&self.shares).encode(out);
-        self.macs.encode(out);
-    }
-
-    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
-        Ok(Self {
-            shares: Bits::decode(reader, &shape.inputs)?.into_f2(),
-            macs: Vec::decode(reader, &(shape.inputs, ()))?,
-        })
-    }
-}
-
-impl Wire for Wrk17InputMsg2 {
-    type Shape = MsgShape;
-
-    fn encoded_len(shape: &MsgShape) -> usize {
-        Bits::encoded_len(&shape.inputs)
-    }
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        Bits::from_f2(&self.masked_inputs).encode(out);
-    }
-
-    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
-        Ok(Self {
-            masked_inputs: Bits::decode(reader, &shape.inputs)?.into_f2(),
-        })
-    }
-}
-
-impl Wire for Wrk17InputMsg3 {
-    type Shape = MsgShape;
-
-    fn encoded_len(shape: &MsgShape) -> usize {
-        <(Vec<F128b>, Bits, Vec<F128b>)>::encoded_len(&(
-            (shape.inputs, ()),
-            shape.outputs,
-            (shape.outputs, ()),
-        ))
-    }
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.labels.encode(out);
-        let (shares, macs): (Vec<F2>, Vec<F128b>) = self.output_decoder.iter().copied().unzip();
-        Bits::from_f2(&shares).encode(out);
-        macs.encode(out);
-    }
-
-    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
-        let labels = Vec::decode(reader, &(shape.inputs, ()))?;
-        let shares = Bits::decode(reader, &shape.outputs)?.into_f2();
-        let macs: Vec<F128b> = Vec::decode(reader, &(shape.outputs, ()))?;
-        Ok(Self {
-            labels,
-            output_decoder: shares.into_iter().zip(macs).collect(),
-        })
     }
 }
 

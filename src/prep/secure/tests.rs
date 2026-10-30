@@ -177,7 +177,13 @@ fn test_secure_open_and_beaver_mul() {
         let shares = p.auth_bits(2 * count as u64).unwrap();
         let opened_all = p.open_values_to(ReceiverParty::All, &shares).unwrap();
         let opened_one = p.open_values_to(ReceiverParty::Party(1), &shares).unwrap();
+        let before = p.session.stats();
         let products = p.beaver_mul(&shares, &indices).unwrap();
+        // d and e are opened in a single round
+        assert_eq!(
+            p.session.stats().frames_sent - before.frames_sent,
+            n as u64 - 1
+        );
         (shares, opened_all, opened_one, products)
     });
     let (shares, opened_all, opened_one, products): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) =

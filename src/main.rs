@@ -1,6 +1,9 @@
+mod config;
+
+use config::{gen_config, read_config};
+
 use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -17,7 +20,7 @@ use multiparty_gc::{
     net::{
         NetError, Network, Session,
         memory::LinkModel,
-        quic::{self, Identity, QuicConfig, certificate_from_pem},
+        quic::{self, Identity, QuicConfig},
     },
     prep::{InsecurePreprocessor, Preprocessor, SecurePrepParams, SecurePreprocessor, run_prep},
 };
@@ -259,57 +262,6 @@ fn bench_once(args: &Args) -> Result<BenchmarkReport, GcError> {
             Ok(report)
         }
     }
-}
-
-/// Write a certificate and key for every party and a configuration listing
-/// `<party id> <address> <certificate file>` per line.
-fn gen_config(num_parties: u16, dir: &Path, host: &str, base_port: u16) -> Result<(), GcError> {
-    let io = |e: std::io::Error| GcError::Net(NetError::Config(e.to_string()));
-    std::fs::create_dir_all(dir).map_err(io)?;
-    let mut config = String::from("# party address certificate\n");
-    for i in 0..num_parties {
-        let (cert, key) = Identity::generate_pem()?;
-        let cert_file = format!("party{i}.cert.pem");
-        std::fs::write(dir.join(&cert_file), cert).map_err(io)?;
-        std::fs::write(dir.join(format!("party{i}.key.pem")), key).map_err(io)?;
-        let port = base_port
-            .checked_add(i)
-            .ok_or_else(|| GcError::Net(NetError::Config("port out of range".into())))?;
-        config.push_str(&format!("{i} {host}:{port} {cert_file}\n"));
-    }
-    std::fs::write(dir.join("parties.conf"), config).map_err(io)?;
-    Ok(())
-}
-
-/// Parse the configuration written by [gen_config], certificate paths are relative to it.
-fn read_config(
-    path: &Path,
-) -> Result<Vec<(SocketAddr, rustls::pki_types::CertificateDer<'static>)>, GcError> {
-    let err = |msg: String| GcError::Net(NetError::Config(msg));
-    let text = std::fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
-    let base = path.parent().unwrap_or(Path::new("."));
-    let mut parties = vec![];
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let fields = line.split_whitespace().collect_vec();
-        let [id, addr, cert] = fields[..] else {
-            return Err(err(format!("invalid line: {line}")));
-        };
-        let id: usize = id
-            .parse()
-            .map_err(|_| err(format!("invalid party: {id}")))?;
-        if id != parties.len() {
-            return Err(err("parties must be listed in order starting from 0".into()));
-        }
-        let addr = addr
-            .parse()
-            .map_err(|_| err(format!("invalid address: {addr}")))?;
-        let pem = std::fs::read(base.join(cert)).map_err(|e| err(format!("{cert}: {e}")))?;
-        parties.push((addr, certificate_from_pem(&pem)?));
-    }
-    Ok(parties)
 }
 
 /// Run a single party over QUIC, only the evaluator returns a report.

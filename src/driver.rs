@@ -22,7 +22,7 @@ use crate::{
     ExtractOutputMsg1, InputMsg2, InputMsg3, MsgShape, OutputMsg1,
     error::GcError,
     evaluator::Evaluator,
-    garbler::Garbler,
+    garbler::{GarbleOutput, Garbler},
     net::{Session, Wire},
 };
 
@@ -53,6 +53,7 @@ where
     G: Garbler,
     E: Evaluator<
             Gc = G::Gc,
+            State = G::EvaluatorState,
             Label = F128b,
             Decoder = <G::IM3 as InputMsg3>::Decoder,
             OM1 = G::OM1,
@@ -79,6 +80,7 @@ where
     G: Garbler,
     E: Evaluator<
             Gc = G::Gc,
+            State = G::EvaluatorState,
             Label = F128b,
             Decoder = <G::IM3 as InputMsg3>::Decoder,
             OM1 = G::OM1,
@@ -102,6 +104,11 @@ where
     let gc = garbler.garble(rng, circuit)?;
 
     if me != evaluator {
+        let GarbleOutput::Garbler(gc) = gc else {
+            return Err(GcError::UnexpectedMessageType(
+                "garbler returned evaluator state".into(),
+            ));
+        };
         if inputs.is_some() {
             return Err(GcError::UnexpectedMessageType(
                 "only the evaluator has inputs".into(),
@@ -129,6 +136,11 @@ where
         });
     }
 
+    let GarbleOutput::Evaluator(state) = gc else {
+        return Err(GcError::UnexpectedMessageType(
+            "evaluator returned a transmitted garbling".into(),
+        ));
+    };
     let inputs = inputs
         .ok_or_else(|| GcError::UnexpectedMessageType("the evaluator needs the inputs".into()))?;
     let gcs = garblers
@@ -142,11 +154,7 @@ where
 
     // The masked inputs are the same for every garbler, we broadcast them so that
     // all garblers are guaranteed to agree on them.
-    let msgs2 = garbler.input_round_2(inputs, msgs1)?;
-    let msg2 = msgs2
-        .into_iter()
-        .next()
-        .ok_or_else(|| GcError::UnexpectedMessageType("no masked inputs".into()))?;
+    let msg2 = garbler.input_round_2(inputs, msgs1)?;
     let msg2: G::IM2 = online.broadcast_from_msg(evaluator, Some(&msg2), &shape(evaluator))?;
     let masked_inputs = msg2.into_masked_inputs();
 
@@ -163,7 +171,7 @@ where
     let garbling_duration = start.elapsed();
 
     let eval_start = Instant::now();
-    let evaluator_state = E::from_garbling(gc);
+    let evaluator_state = E::from_state(state);
     let encoded = evaluator_state.eval(circuit, gcs, masked_inputs, labels)?;
     let msgs1 = encoded.extract_outupt_msg1(rng);
     let (chi, msgs2) = if G::OUTPUT_CHECK {

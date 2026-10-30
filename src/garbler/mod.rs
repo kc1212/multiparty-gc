@@ -16,7 +16,8 @@ pub mod wrk17;
 /// The methods are message-in/message-out, every message that is sent to another party
 /// has a [Wire] encoding whose shape is the [MsgShape] with the sender of the message.
 pub trait Garbler {
-    type Gc: Garbling + Wire<Shape = MsgShape>;
+    type Gc: Wire<Shape = MsgShape>;
+    type EvaluatorState;
     type IM1: InputMsg1 + Wire<Shape = MsgShape>;
     type IM2: InputMsg2 + Clone + Wire<Shape = MsgShape>;
     type IM3: InputMsg3 + Wire<Shape = MsgShape>;
@@ -30,19 +31,16 @@ pub trait Garbler {
         &mut self,
         rng: &mut R,
         circuit: &Circuit,
-    ) -> Result<Self::Gc, GcError>;
+    ) -> Result<GarbleOutput<Self::Gc, Self::EvaluatorState>, GcError>;
     fn party_id(&self) -> u16;
     fn num_parties(&self) -> u16;
 
     /// Called by the garblers, messages are sent to the single evaluator.
     fn input_round_1(&self) -> Self::IM1;
 
-    /// Called by the evaluator, messages are sent to the garblers.
-    fn input_round_2(
-        &self,
-        true_inputs: &[F2],
-        msgs: Vec<Self::IM1>,
-    ) -> Result<Vec<Self::IM2>, GcError>;
+    /// Called by the evaluator to produce the message broadcast to all garblers.
+    fn input_round_2(&self, true_inputs: &[F2], msgs: Vec<Self::IM1>)
+    -> Result<Self::IM2, GcError>;
 
     /// Called by the garblers, messages are sent to the evaluator.
     fn input_round_3(&self, msg: Self::IM2) -> Self::IM3;
@@ -82,9 +80,10 @@ pub trait Garbler {
     }
 }
 
-pub trait Garbling {
-    // size in bytes
-    fn estimate_size(&self) -> usize;
+/// Local result of garbling: only the garbler variant is a network message.
+pub enum GarbleOutput<Message, EvaluatorState> {
+    Garbler(Message),
+    Evaluator(EvaluatorState),
 }
 
 pub(crate) fn auth_bits_from_prep<P: Preprocessor>(

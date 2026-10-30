@@ -413,7 +413,7 @@ fn test_pairwise_channels_only_once() {
 
 #[test]
 fn test_inbox_buffer_limit() {
-    let inbox = Inbox::new(7, 10);
+    let inbox = Inbox::new(7, super::buffer::FRAME_OVERHEAD + 10);
     let stream = StreamId([0; 16]);
     let now = Instant::now();
     inbox.push(stream, now, vec![0; 6]).unwrap();
@@ -426,4 +426,100 @@ fn test_inbox_buffer_limit() {
         inbox.pop(stream, now + Duration::from_secs(1)),
         Err(NetError::BufferLimit(7))
     ));
+}
+
+#[test]
+fn test_pairwise_channel_rejects_empty_frames() {
+    use scuttlebutt::AbstractChannel;
+    let outputs = run_all(default_mesh(2), |net| {
+        let mut session = net.session("ot").unwrap();
+        if net.party_id() == 0 {
+            session
+                .child("pairwise channels")
+                .unwrap()
+                .send(1, &[])
+                .unwrap();
+            None
+        } else {
+            let (_, mut channel) = session.pairwise_channels().unwrap().pop().unwrap();
+            Some(channel.read_bytes(&mut [0]).unwrap_err().to_string())
+        }
+    });
+    assert!(
+        outputs[1]
+            .as_ref()
+            .unwrap()
+            .contains("empty byte-channel frame")
+    );
+}
+
+#[test]
+fn test_broadcast_with_private() {
+    let outputs = run_all(default_mesh(3), |net| {
+        let me = net.party_id();
+        let mut s = net.session("s").unwrap();
+        let before = s.stats();
+        let (publics, privates) = s
+            .broadcast_all_with_private_msg(&[me as u8; 2], |j| [me as u8, j as u8], &(), &())
+            .unwrap();
+        // one round for the messages and one for the echo
+        assert_eq!(s.stats().frames_sent - before.frames_sent, 2 * 2);
+        (publics, privates.into_peers().collect_vec())
+    });
+    for (me, (publics, privates)) in outputs.into_iter().enumerate() {
+        assert_eq!(publics, (0..3u8).map(|j| [j; 2]).collect_vec());
+        for (j, private) in privates {
+            assert_eq!(private, [j as u8, me as u8]);
+        }
+    }
+}
+
+#[test]
+fn test_broadcast_with_private_equivocation() {
+    let outputs = run_all(default_mesh(3), |net| {
+        let mut s = net.session("s").unwrap();
+        if net.party_id() == 0 {
+            // the public part differs for party 2, the private parts may differ anyway
+            s.broadcast_all_with_private_msg_with(
+                &[1u8],
+                |j| if j == 2 { [2u8] } else { [1u8] },
+                |j| [j as u8],
+                &(),
+                &(),
+            )
+            .map(|_| ())
+        } else {
+            s.broadcast_all_with_private_msg(&[1u8], |j| [j as u8], &(), &())
+                .map(|_| ())
+        }
+    });
+    assert!(matches!(outputs[1], Err(NetError::CheatDetected(_))));
+    assert!(matches!(outputs[2], Err(NetError::CheatDetected(_))));
+}
+
+#[test]
+fn test_send_to_all() {
+    let outputs = run_all(default_mesh(3), |net| {
+        let me = net.party_id();
+        let mut s = net.session("s").unwrap();
+        let before = s.stats();
+        let all = s.send_to_all_msg(&[me as u8; 3], &()).unwrap();
+        // no echo round
+        assert_eq!(s.stats().frames_sent - before.frames_sent, 2);
+        all
+    });
+    for all in outputs {
+        assert_eq!(all, (0..3u8).map(|j| [j; 3]).collect_vec());
+    }
+}
+
+#[test]
+fn test_coin_rounds() {
+    run_all(default_mesh(3), |net| {
+        let mut s = net.session("s").unwrap();
+        let before = s.stats();
+        s.coin(&mut AesRng::new()).unwrap();
+        // commitments, their echo, and the openings without echo
+        assert_eq!(s.stats().frames_sent - before.frames_sent, 3 * 2);
+    });
 }

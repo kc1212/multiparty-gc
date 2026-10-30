@@ -24,6 +24,7 @@ use std::{
 
 use thiserror::Error;
 
+mod buffer;
 mod inbox;
 pub mod memory;
 pub mod quic;
@@ -63,6 +64,8 @@ pub enum NetError {
     Malformed { party: PartyId, reason: String },
     #[error("party {0} exceeded the receive buffer limit")]
     BufferLimit(PartyId),
+    #[error("our send queue to party {0} is full")]
+    SendQueueFull(PartyId),
     #[error("cheating detected: {0}")]
     CheatDetected(String),
     #[error("session {0} already exists")]
@@ -135,7 +138,7 @@ impl StatsCell {
         self.frames_received.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> Stats {
+    pub(crate) fn snapshot(&self) -> Stats {
         Stats {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),

@@ -262,6 +262,7 @@ where
     G: Garbler + Send,
     E: Evaluator<
             Gc = G::Gc,
+            State = G::EvaluatorState,
             Label = F128b,
             Decoder = <G::IM3 as InputMsg3>::Decoder,
             OM1 = G::OM1,
@@ -425,7 +426,7 @@ mod test {
         evaluator::{Evaluator, copz::CopzEvaluator, wrk17::Wrk17Evaluator},
         full_simulation,
         garbler::{
-            Garbler,
+            GarbleOutput, Garbler,
             copz::{CopzGarbler, CopzGarbling, CopzInputMsg2},
             wrk17::{Wrk17Garbler, Wrk17InputMsg2},
         },
@@ -497,6 +498,7 @@ mod test {
         G: Garbler + Send,
         E: Evaluator<
                 Gc = G::Gc,
+                State = G::EvaluatorState,
                 Label = F128b,
                 Decoder = <G::IM3 as InputMsg3>::Decoder,
                 OM1 = G::OM1,
@@ -834,13 +836,17 @@ mod test {
                 .map(|g| {
                     s.spawn(|| {
                         let mut rng = AesRng::new();
-                        g.garble(&mut rng, &circuit.circuit).unwrap()
+                        match g.garble(&mut rng, &circuit.circuit).unwrap() {
+                            GarbleOutput::Garbler(message) => Some(message),
+                            GarbleOutput::Evaluator(_) => None,
+                        }
                     })
                 })
                 .collect_vec();
-            let mut gcs = handles.into_iter().map(|h| h.join().unwrap()).collect_vec();
-            gcs.pop(); // the evaluator's garbling is never sent
-            gcs
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect()
         })
     }
 
