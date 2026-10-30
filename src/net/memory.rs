@@ -2,6 +2,7 @@
 //! latency and bandwidth model.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -30,12 +31,36 @@ impl LinkModel {
     }
 }
 
+/// Modifies a frame before it is delivered. The arguments are the sender, the receiver,
+/// the stream, the index of the frame among the frames on this stream from the sender
+/// to the receiver, and the frame. Only useful to simulate malicious parties in tests.
+pub type Tamper = Arc<dyn Fn(PartyId, PartyId, StreamId, u64, &mut Vec<u8>) + Send + Sync>;
+
 /// Create fully connected networks for `party_count` parties in this process,
 /// the network of party `i` is at index `i`.
 pub fn mesh(
     party_count: u16,
     model: LinkModel,
     config: NetworkConfig,
+) -> Result<Vec<Network>, NetError> {
+    mesh_inner(party_count, model, config, None)
+}
+
+/// Same as [mesh], but every frame passes through `tamper`.
+pub fn mesh_with_tamper(
+    party_count: u16,
+    model: LinkModel,
+    config: NetworkConfig,
+    tamper: Tamper,
+) -> Result<Vec<Network>, NetError> {
+    mesh_inner(party_count, model, config, Some(tamper))
+}
+
+fn mesh_inner(
+    party_count: u16,
+    model: LinkModel,
+    config: NetworkConfig,
+    tamper: Option<Tamper>,
 ) -> Result<Vec<Network>, NetError> {
     if party_count < 2 {
         return Err(NetError::Config("need at least two parties".into()));
@@ -62,6 +87,8 @@ pub fn mesh(
                             model,
                             schedule: Mutex::new(Schedule::default()),
                             local_closed: Mutex::new(None),
+                            tamper: tamper.clone(),
+                            frame_counts: Mutex::new(HashMap::new()),
                         }) as Box<dyn PeerLink>
                     })
                 })
@@ -90,6 +117,9 @@ struct MemoryLink {
     schedule: Mutex<Schedule>,
     /// Set when we aborted or closed the link ourselves.
     local_closed: Mutex<Option<NetError>>,
+    tamper: Option<Tamper>,
+    /// Number of frames sent per stream, passed to `tamper`.
+    frame_counts: Mutex<HashMap<StreamId, u64>>,
 }
 
 impl MemoryLink {
@@ -116,9 +146,15 @@ impl MemoryLink {
 }
 
 impl PeerLink for MemoryLink {
-    fn send(&self, stream: StreamId, frame: Vec<u8>) -> Result<(), NetError> {
+    fn send(&self, stream: StreamId, mut frame: Vec<u8>) -> Result<(), NetError> {
         if let Some(err) = self.local_closed.lock().unwrap().clone() {
             return Err(err);
+        }
+        if let Some(tamper) = &self.tamper {
+            let mut counts = self.frame_counts.lock().unwrap();
+            let index = counts.entry(stream).or_default();
+            tamper(self.me, self.peer, stream, *index, &mut frame);
+            *index += 1;
         }
         let deliver_at = self.delivery_time(frame.len());
         self.outbox

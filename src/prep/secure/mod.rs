@@ -22,7 +22,7 @@
 //! - The final check of Π_LaAND is compressed with a random linear combination over
 //!   `F_{2^128}` (instead of ρ binary combinations) before it is committed and opened.
 
-use std::{collections::VecDeque, time::Duration};
+use std::collections::VecDeque;
 
 mod auth;
 mod params;
@@ -30,7 +30,6 @@ mod triples;
 
 pub use params::SecurePrepParams;
 
-use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng};
 use scuttlebutt::{AesHash, AesRng, Block, ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
@@ -38,13 +37,13 @@ use swanky_field_binary::{F2, F128b};
 use crate::{
     error::GcError,
     net::{
-        Bits, NetworkConfig, Session,
+        NetworkConfig, Session,
         memory::{LinkModel, mesh},
     },
     sharing::AuthShare,
 };
 
-use super::{Preprocessor, ReceiverParty, StaticPreprocessor, Triple};
+use super::{Preprocessor, ReceiverParty, StaticPreprocessor, Triple, open_with_mac_check};
 
 const F128B_LEN: usize = 16;
 
@@ -104,8 +103,6 @@ pub struct SecurePreprocessor {
     bits_needed: usize,
     /// Number of AND triples to generate.
     triples_needed: usize,
-    /// Simulated latency for every opening in the function-dependent phase.
-    open_delay: Option<Duration>,
     prepped: bool,
     auth_bits: VecDeque<AuthShare<F2, F128b>>,
     triples: VecDeque<Triple>,
@@ -125,7 +122,6 @@ impl SecurePreprocessor {
         bits: usize,
         triples: usize,
         params: SecurePrepParams,
-        open_delay: Option<Duration>,
     ) -> Result<Self, GcError> {
         let bucket_size = params.bucket_size_for(triples)?;
         // Validate all material and field-message sizes before starting any party.
@@ -157,7 +153,6 @@ impl SecurePreprocessor {
             bucket_size,
             bits_needed: bits,
             triples_needed: triples,
-            open_delay,
             prepped: false,
             auth_bits: VecDeque::new(),
             triples: VecDeque::new(),
@@ -175,21 +170,12 @@ impl SecurePreprocessor {
         bits: usize,
         triples: usize,
         params: SecurePrepParams,
-        open_delay: Option<Duration>,
     ) -> Result<Vec<Self>, GcError> {
         mesh(party_count, LinkModel::default(), NetworkConfig::default())?
             .into_iter()
             .map(|net| {
                 let session = net.session("secure prep")?;
-                Self::new(
-                    session,
-                    rng,
-                    tweak_delta_lsb,
-                    bits,
-                    triples,
-                    params,
-                    open_delay,
-                )
+                Self::new(session, rng, tweak_delta_lsb, bits, triples, params)
             })
             .collect()
     }
@@ -300,74 +286,13 @@ impl SecurePreprocessor {
         receiver_party: ReceiverParty,
         xs: &[AuthShare<F2, F128b>],
     ) -> Result<Option<Vec<F2>>, GcError> {
-        if let ReceiverParty::Party(receiver) = receiver_party
-            && receiver >= self.party_count
-        {
-            return Err(GcError::WrongOpening(format!(
-                "invalid receiver {receiver}"
-            )));
-        }
-        if xs.iter().any(|x| {
-            x.party_id != self.party_id
-                || x.mac_keys.len() != self.party_count as usize
-                || x.mac_values.len() != self.party_count as usize
-        }) {
-            return Err(GcError::WrongOpening(
-                "invalid authenticated share shape or owner".into(),
-            ));
-        }
-        let me = self.party_id;
-        let is_receiver = |j: u16| match receiver_party {
-            ReceiverParty::All => true,
-            ReceiverParty::Party(r) => r == j,
-        };
-        // only simulate latency in the function-dependent phase, like the insecure preprocessor
-        if self.prepped
-            && let Some(dur) = self.open_delay
-        {
-            std::thread::sleep(dur);
-        }
-
-        let mut my_shares = Bits(xs.iter().map(|x| bool::from(x.share)).collect());
         let wrong_opening = if self.prepped {
             Cheat::BeaverWrongOpening
         } else {
             Cheat::BucketWrongOpening
         };
-        if self.cheating(wrong_opening) && !xs.is_empty() {
-            my_shares.0[0] ^= true;
-        }
-        for peer in self.session.peers() {
-            if is_receiver(peer) {
-                let digest = mac_digest(
-                    self.session.sid(),
-                    xs.iter().map(|x| x.mac_values[peer as usize]),
-                );
-                self.session.send_msg(peer, &(my_shares.clone(), digest))?;
-            }
-        }
-        if !is_receiver(me) {
-            return Ok(None);
-        }
-
-        let mut output = xs.iter().map(|x| bool::from(x.share)).collect_vec();
-        for peer in self.session.peers() {
-            let (Bits(shares), digest): (Bits, [u8; blake3::OUT_LEN]) =
-                self.session.recv_msg(peer, &(xs.len(), ()))?;
-            let expected = mac_digest(
-                self.session.sid(),
-                xs.iter()
-                    .zip(&shares)
-                    .map(|(x, s)| x.mac_keys[peer as usize] + mul_bit(*s, self.delta)),
-            );
-            if expected != digest {
-                self.detected(GcError::MacCheckFailure)?;
-            }
-            for (o, s) in output.iter_mut().zip(shares) {
-                *o ^= s;
-            }
-        }
-        Ok(Some(output.into_iter().map(F2::from).collect()))
+        let tamper = self.cheating(wrong_opening);
+        open_with_mac_check(&mut self.session, self.delta, receiver_party, xs, tamper)
     }
 
     fn prep_inner(&mut self) -> Result<(), GcError> {
@@ -420,16 +345,6 @@ fn hash(
         | ((domain as u128) << 8)
         | bit as u128;
     block_to_f128b(tccr.tccr_hash(Block::from(tweak), f128b_to_block(x)))
-}
-
-/// Digest of the MACs of opened shares, bound to the session.
-fn mac_digest(sid: &[u8; 32], macs: impl Iterator<Item = F128b>) -> [u8; blake3::OUT_LEN] {
-    let mut hasher = blake3::Hasher::new_derive_key("multiparty-gc opening macs v1");
-    hasher.update(sid);
-    for mac in macs {
-        hasher.update(&mac.to_bytes());
-    }
-    *hasher.finalize().as_bytes()
 }
 
 fn f128b_to_block(x: F128b) -> Block {

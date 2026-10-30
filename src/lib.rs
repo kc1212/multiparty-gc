@@ -1,20 +1,26 @@
 use std::{
     io::{BufReader, Read},
     path::Path,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bristol_fashion::Circuit;
+use driver::run_party;
+use error::GcError;
 use evaluator::Evaluator;
-use garbler::{Garbler, Garbling};
+use garbler::Garbler;
 use generic_array::GenericArray;
 use itertools::Itertools;
 use rand::{CryptoRng, Rng, SeedableRng};
 use scuttlebutt::{AesRng, ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
-use crate::net::Wire;
+use crate::net::{
+    Network, NetworkConfig, Session, Wire,
+    memory::{LinkModel, mesh},
+};
 
+pub mod driver;
 pub mod error;
 pub mod evaluator;
 pub mod garbler;
@@ -65,8 +71,19 @@ pub trait ExtractOutputMsg1 {
     fn extract_outupt_msg1<R: Rng + CryptoRng>(&self, rng: &mut R) -> Vec<Self::OM1>;
 }
 
-pub trait OutputMsg1 {
+/// The message of the output check that the evaluator sends to every garbler.
+///
+/// It consists of a part that must be the same for all garblers, which the evaluator
+/// broadcasts, and a part that is sent to one garbler only.
+pub trait OutputMsg1: Sized {
+    type Public: Wire<Shape = MsgShape>;
+    type Private: Wire<Shape = MsgShape>;
+
     fn chi(&self) -> [u8; 32];
+
+    fn split(self) -> (Self::Public, Self::Private);
+
+    fn join(public: Self::Public, private: Self::Private) -> Self;
 }
 
 pub trait OutputMsg2 {}
@@ -74,8 +91,19 @@ pub trait OutputMsg2 {}
 pub struct DummyOutput;
 
 impl OutputMsg1 for DummyOutput {
+    type Public = DummyOutput;
+    type Private = DummyOutput;
+
     fn chi(&self) -> [u8; 32] {
         [0u8; 32]
+    }
+
+    fn split(self) -> (DummyOutput, DummyOutput) {
+        (DummyOutput, DummyOutput)
+    }
+
+    fn join(_: DummyOutput, _: DummyOutput) -> Self {
+        DummyOutput
     }
 }
 
@@ -133,234 +161,6 @@ pub fn universal_hash(chi: &[u8; 32], elements: &[F128b]) -> F128b {
         .fold(F128b::ZERO, |acc, x| acc + x)
 }
 
-/// Encode and decode `msg` as if it was sent over the network by `shape.sender`.
-fn relay<T: Wire<Shape = MsgShape>>(msg: T, shape: &MsgShape) -> T {
-    T::from_wire_bytes(&msg.to_wire_bytes(), shape).expect("honest messages always decode")
-}
-
-pub struct EvaluationMaterial<E: Evaluator> {
-    evaluator: E,
-    gcs: Vec<E::Gc>,
-    masked_inputs: Vec<F2>,
-    input_labels: Vec<Vec<E::Label>>,
-    decoder: Vec<E::Decoder>,
-}
-
-pub fn simulate_until_eval<
-    G: Garbler + Send + 'static,
-    E: Evaluator<
-            Gc = G::Gc,
-            Label = F128b,
-            Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
-            OM1 = G::OM1,
-            OM2 = G::OM2,
-            GarbledOutput = EO,
-        >,
-    EO: ExtractOutputMsg1<OM1 = G::OM1>,
->(
-    garblers: &mut Vec<G>,
-    circuit: &Circuit,
-    true_inputs: &[F2],
-    latency: Option<Duration>,
-) -> (EvaluationMaterial<E>, Duration)
-where
-    <G as Garbler>::Gc: Send,
-{
-    let start = Instant::now();
-    // We use scoped threads so that we can borrow non-static data and
-    // garble in parallel.
-    let mut gcs = std::thread::scope(|s| {
-        let mut handles = vec![];
-        for (i, garbler) in garblers.iter_mut().enumerate() {
-            handles.push(s.spawn(move || {
-                // Communication during garbling assuming preprocessing is completed
-                // is just opening for the Beaver multiplication
-                let mut rng = AesRng::from_entropy();
-                (garbler.garble(&mut rng, circuit), i)
-            }));
-        }
-
-        let mut gcs = vec![];
-        for handle in handles {
-            let (gc, _i) = handle.join().unwrap();
-            #[cfg(test)]
-            println!("Joined garbler {_i}");
-            gcs.push(gc);
-        }
-        gcs
-    });
-
-    if let Some(_dur) = latency {
-        let estimate_gc_size: usize = gcs.iter().map(|gc| gc.estimate_size()).sum();
-        const HUNDRED_MEGA_BYTE_PER_MILLIS: usize = 100 * 1024 * 1024 / 8 / 1000;
-        let dur = (estimate_gc_size / HUNDRED_MEGA_BYTE_PER_MILLIS) as u64;
-        std::thread::sleep(Duration::from_millis(dur / (garblers.len() as u64 - 1)));
-    }
-
-    let final_garbler = garblers.pop().unwrap();
-    let evaluator_gc = gcs.pop().unwrap();
-    let party_count = final_garbler.num_parties();
-    let evaluator_id = party_count - 1;
-    let shape = |sender| MsgShape::new(circuit, party_count, sender);
-    // the garblers send their garbled circuits to the evaluator
-    let gcs = gcs
-        .into_iter()
-        .enumerate()
-        .map(|(i, gc)| relay(gc, &shape(i as u16)))
-        .collect_vec();
-
-    // do the first round of communication
-    // the garblers (n-1 of them) send a message to the evaluator
-    let msgs_round1 = garblers
-        .iter()
-        .map(|garbler| relay(garbler.input_round_1(), &shape(garbler.party_id())))
-        .collect_vec();
-    if let Some(dur) = latency {
-        std::thread::sleep(dur);
-    }
-
-    // do the second round of communication
-    // the evaluator processes the messages and then creates the response
-    let msgs_round2 = final_garbler
-        .input_round_2(true_inputs, msgs_round1)
-        .unwrap()
-        .into_iter()
-        .map(|msg| relay(msg, &shape(evaluator_id)))
-        .collect_vec();
-    let masked_inputs = msgs_round2[0].clone().into_masked_inputs();
-    if let Some(dur) = latency {
-        std::thread::sleep(dur);
-    }
-
-    // do the final round of communication
-    let (msgs_round3, decoder): (Vec<Vec<F128b>>, Vec<_>) = garblers
-        .iter()
-        .zip(msgs_round2)
-        .map(|(garbler, msg)| {
-            relay(garbler.input_round_3(msg), &shape(garbler.party_id())).into_labels_and_decoder()
-        })
-        .unzip();
-    if let Some(dur) = latency {
-        std::thread::sleep(dur);
-    }
-
-    let evaluator = E::from_garbling(evaluator_gc);
-
-    (
-        EvaluationMaterial {
-            evaluator,
-            gcs,
-            masked_inputs,
-            input_labels: msgs_round3,
-            decoder,
-        },
-        start.elapsed(),
-    )
-}
-
-pub fn simulate_eval_and_decode<
-    G: Garbler + Send + 'static,
-    E: Evaluator<
-            Gc = G::Gc,
-            Label = F128b,
-            Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
-            OM1 = G::OM1,
-            OM2 = G::OM2,
-            GarbledOutput = EO,
-        >,
-    EO: ExtractOutputMsg1<OM1 = G::OM1>,
->(
-    garblers: Vec<G>,
-    circuit: &Circuit,
-    true_inputs: Vec<F2>,
-    eval_material: EvaluationMaterial<E>,
-    latency: Option<Duration>,
-    check_output: bool,
-) -> Duration
-where
-    <G as Garbler>::Gc: Send,
-{
-    let start = Instant::now();
-    let EvaluationMaterial::<E> {
-        evaluator,
-        gcs,
-        masked_inputs,
-        input_labels: msgs_round3,
-        decoder,
-    } = eval_material;
-
-    let encoded_output = evaluator
-        .eval(circuit, gcs, masked_inputs.clone(), msgs_round3)
-        .unwrap();
-
-    let mut rng = AesRng::new();
-    let party_count = garblers.len() as u16 + 1;
-    let shape = |sender| MsgShape::new(circuit, party_count, sender);
-    let output_msgs_1 = encoded_output
-        .extract_outupt_msg1(&mut rng)
-        .into_iter()
-        .map(|msg| relay(msg, &shape(party_count - 1)))
-        .collect_vec();
-    let has_check_round = !output_msgs_1.is_empty();
-
-    let chi = if has_check_round {
-        output_msgs_1[0].chi()
-    } else {
-        [0u8; 32]
-    };
-
-    // round of communication for sending chi and h^i to garblers
-    // this is not used for WRK17
-    if has_check_round {
-        if let Some(dur) = latency {
-            std::thread::sleep(dur);
-        }
-    }
-
-    // First rounds of communication
-    // this round is not needed for WRK17
-    let output_msgs2 = garblers
-        .into_iter()
-        .zip(output_msgs_1)
-        .map(|(garbler, msg1)| {
-            let msg2 = garbler
-                .check_output_msg1(msg1, &masked_inputs, circuit)
-                .unwrap();
-            relay(msg2, &shape(garbler.party_id()))
-        })
-        .collect_vec();
-
-    // round of communication for z^i from garblers to the evaluator
-    // this is not used for WRK17
-    if has_check_round {
-        if let Some(dur) = latency {
-            std::thread::sleep(dur);
-        }
-    }
-
-    // now we need to decode the output
-    let final_result = evaluator
-        .check_and_decode(output_msgs2, &chi, encoded_output, decoder, circuit)
-        .unwrap();
-
-    let elapsed = start.elapsed();
-
-    if check_output {
-        let plain_eval_inputs = true_inputs
-            .iter()
-            .map(|x| if *x == F2::ZERO { 0u8 } else { 1u8 })
-            .collect_vec();
-        let expected_result = eval_clear_circuit(circuit, plain_eval_inputs)
-            .into_iter()
-            .map(|x| F2::from_bytes(&[x].into()).unwrap())
-            .collect_vec();
-
-        assert_eq!(final_result, expected_result);
-    }
-
-    elapsed
-}
-
 pub struct NamedCircuit {
     circuit: Circuit,
     name: String,
@@ -394,52 +194,133 @@ impl NamedCircuit {
     }
 }
 
-pub fn full_simulation<
-    G: Garbler + Send + 'static,
-    E: Evaluator<
-            Gc = G::Gc,
-            Label = F128b,
-            Decoder = <<G as Garbler>::IM3 as InputMsg3>::Decoder,
-            OM1 = G::OM1,
-            OM2 = G::OM2,
-            GarbledOutput = EO,
-        >,
-    EO: ExtractOutputMsg1<OM1 = G::OM1>,
->(
-    mut garblers: Vec<G>,
+/// The network and sessions of one party.
+pub struct PartySetup {
+    pub network: Network,
+    /// Session for the preprocessor, it is also used for the openings during garbling.
+    pub prep: Session,
+    /// Session for the online phase, see [driver::run_party].
+    pub online: Session,
+}
+
+/// Connect `party_count` parties in this process with the in-memory transport.
+pub fn in_memory_setup(party_count: u16, model: LinkModel) -> Result<Vec<PartySetup>, GcError> {
+    mesh(party_count, model, NetworkConfig::default())?
+        .into_iter()
+        .map(|network| {
+            Ok(PartySetup {
+                prep: network.session("prep")?,
+                online: network.session("online")?,
+                network,
+            })
+        })
+        .collect()
+}
+
+/// A party of [full_simulation].
+pub struct SimParty<G> {
+    pub garbler: G,
+    pub online: Session,
+    /// Used to report the communication.
+    pub network: Network,
+}
+
+/// Run all parties in this process (one thread per party) with [driver::run_party].
+///
+/// The evaluator (the last party) has all the inputs. If `check_output` is set,
+/// the output is compared with the plaintext evaluation of the circuit.
+/// The `prep_duration` of the report is zero.
+pub fn full_simulation<G, E>(
+    parties: Vec<SimParty<G>>,
     circuit: &NamedCircuit,
     true_inputs: Vec<F2>,
     check_output: bool,
     benchmark_tag: Option<String>,
     latency: Option<Duration>,
-) -> BenchmarkReport
+) -> Result<BenchmarkReport, GcError>
 where
-    <G as Garbler>::Gc: Send,
+    G: Garbler + Send,
+    E: Evaluator<
+            Gc = G::Gc,
+            Label = F128b,
+            Decoder = <G::IM3 as InputMsg3>::Decoder,
+            OM1 = G::OM1,
+            OM2 = G::OM2,
+        >,
+    E::GarbledOutput: ExtractOutputMsg1<OM1 = G::OM1>,
 {
-    let party_count = garblers.len();
+    let party_count = parties.len();
     let input_count = true_inputs.len();
-    let (eval_material, garbling_duration): (EvaluationMaterial<E>, Duration) =
-        simulate_until_eval(&mut garblers, &circuit.circuit, &true_inputs, latency);
+    let evaluator = party_count - 1;
+    let results = std::thread::scope(|s| {
+        let handles = parties
+            .into_iter()
+            .enumerate()
+            .map(|(i, party)| {
+                let inputs = (i == evaluator).then_some(true_inputs.as_slice());
+                s.spawn(move || {
+                    let SimParty {
+                        garbler,
+                        mut online,
+                        network,
+                    } = party;
+                    let mut rng = AesRng::from_entropy();
+                    let report = run_party::<G, E, _>(
+                        garbler,
+                        &mut online,
+                        &circuit.circuit,
+                        inputs,
+                        &mut rng,
+                    );
+                    (report, network.stats())
+                })
+            })
+            .collect_vec();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("party panicked"))
+            .collect_vec()
+    });
 
-    let evaluation_duration = simulate_eval_and_decode(
-        garblers,
-        &circuit.circuit,
-        true_inputs,
-        eval_material,
-        latency,
-        check_output,
-    );
+    let mut prep_bytes = 0;
+    let mut online_bytes = 0;
+    let mut reports = vec![];
+    for (report, stats) in results {
+        for (label, stats) in stats {
+            if label == "online" {
+                online_bytes += stats.bytes_sent;
+            } else {
+                prep_bytes += stats.bytes_sent;
+            }
+        }
+        reports.push(report?);
+    }
+    let report = reports.pop().expect("at least two parties");
 
-    BenchmarkReport {
+    if check_output {
+        let plain_eval_inputs = true_inputs
+            .iter()
+            .map(|x| if *x == F2::ZERO { 0u8 } else { 1u8 })
+            .collect_vec();
+        let expected_result = eval_clear_circuit(&circuit.circuit, plain_eval_inputs)
+            .into_iter()
+            .map(|x| F2::from_bytes(&[x].into()).unwrap())
+            .collect_vec();
+        assert_eq!(report.outputs, Some(expected_result));
+    }
+
+    Ok(BenchmarkReport {
         prep_duration: Duration::ZERO,
-        garbling_duration,
-        evaluation_duration,
+        garbling_duration: report.garbling_duration,
+        evaluation_duration: report.evaluation_duration,
         party_count,
         input_count,
         circuit_name: circuit.name.clone(),
         benchmark_tag,
         latency,
-    }
+        prep_bytes,
+        online_bytes,
+    })
 }
 
 pub struct BenchmarkReport {
@@ -452,6 +333,11 @@ pub struct BenchmarkReport {
     pub circuit_name: String,
     pub benchmark_tag: Option<String>,
     pub latency: Option<Duration>,
+    /// Bytes sent by all parties on the preprocessing session (the function-independent
+    /// preprocessing and the openings during garbling).
+    pub prep_bytes: u64,
+    /// Bytes sent by all parties in the online phase.
+    pub online_bytes: u64,
 }
 
 impl BenchmarkReport {
@@ -460,13 +346,13 @@ impl BenchmarkReport {
     }
 
     pub fn csv_header() -> String {
-        "garbling_duration,evaluation_duration,total_duration,latency,party_count,input_count,circuit,tag,prep_duration"
+        "garbling_duration,evaluation_duration,total_duration,latency,party_count,input_count,circuit,tag,prep_duration,prep_bytes,online_bytes"
             .to_string()
     }
 
     pub fn csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{}",
             self.garbling_duration.as_millis(),
             self.evaluation_duration.as_millis(),
             self.total_duration().as_millis(),
@@ -479,6 +365,8 @@ impl BenchmarkReport {
                 None => "-",
             },
             self.prep_duration.as_millis(),
+            self.prep_bytes,
+            self.online_bytes,
         )
     }
 }
@@ -511,24 +399,34 @@ fn eval_clear_circuit(circuit: &Circuit, inputs: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
-    use std::io::BufReader;
+    use std::{io::BufReader, sync::Arc, time::Duration};
 
     use itertools::Itertools;
+    use rand::Rng;
     use scuttlebutt::{AesRng, ring::FiniteRing};
     use swanky_field_binary::F2;
 
     use crate::{
-        MsgShape, NamedCircuit, eval_clear_circuit,
-        evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
+        BenchmarkReport, ExtractOutputMsg1, InputMsg3, MsgShape, NamedCircuit, SimParty,
+        error::GcError,
+        eval_clear_circuit,
+        evaluator::{Evaluator, copz::CopzEvaluator, wrk17::Wrk17Evaluator},
         full_simulation,
         garbler::{
             Garbler,
             copz::{CopzGarbler, CopzGarbling, CopzInputMsg2},
             wrk17::{Wrk17Garbler, Wrk17InputMsg2},
         },
-        net::Wire,
-        prep::{InsecurePreprocessor, SecurePrepParams, SecurePreprocessor, run_prep},
+        in_memory_setup,
+        net::{
+            Network, NetworkConfig, PartyId, Session, StreamId, Wire,
+            memory::{LinkModel, Tamper, mesh_with_tamper},
+        },
+        prep::{
+            InsecurePreprocessor, Preprocessor, SecurePrepParams, SecurePreprocessor, run_prep,
+        },
     };
+    use swanky_field_binary::F128b;
 
     #[test]
     fn test_clear_circuit() {
@@ -540,77 +438,383 @@ mod test {
         assert_eq!(eval_clear_circuit(&circuit, vec![1, 1]), vec![1]);
     }
 
-    fn run_wrk17_insecure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
-        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
-        let triples = circuit.nand();
-        let bits = circuit.nand() + input_wire_count;
+    /// (preprocessor session, online session, network) of every party
+    type Setup = Vec<(Session, Session, Network)>;
 
-        // prepare preprocessor
-        let mut rng = AesRng::new();
-        let (preps, runner) = InsecurePreprocessor::new(
-            &mut rng,
-            num_parties,
-            false,
-            bits as usize,
-            triples as usize,
-            None,
-        );
-        let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
-
-        let garblers = preps
-            .into_iter()
-            .enumerate()
-            .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
-            .collect_vec();
-
-        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true, None, None);
-
-        // shutdown
-        prep_handler.join().unwrap();
+    fn make_setup(n: u16, model: LinkModel, tamper: Option<Tamper>) -> Setup {
+        match tamper {
+            None => in_memory_setup(n, model)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.prep, s.online, s.network))
+                .collect(),
+            Some(tamper) => mesh_with_tamper(n, model, NetworkConfig::default(), tamper)
+                .unwrap()
+                .into_iter()
+                .map(|net| {
+                    (
+                        net.session("prep").unwrap(),
+                        net.session("online").unwrap(),
+                        net,
+                    )
+                })
+                .collect(),
+        }
     }
 
-    fn run_copz_insecure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
-        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
-        let triples = circuit.nand();
-        let bits = circuit.nand() + input_wire_count;
+    /// The stream of the online session, it is the same for all parties.
+    fn online_stream() -> StreamId {
+        make_setup(2, LinkModel::default(), None)[0].1.stream_id()
+    }
 
-        // prepare preprocessor
+    fn counts(circuit: &NamedCircuit) -> (usize, usize) {
+        let inputs: u64 = circuit.input_sizes().iter().sum();
+        ((circuit.nand() + inputs) as usize, circuit.nand() as usize)
+    }
+
+    /// Run the preprocessing and then the protocol with `new` creating the garblers.
+    fn simulate<P, G, E>(
+        setup: Setup,
+        circuit: &NamedCircuit,
+        true_inputs: Vec<F2>,
+        make_prep: impl Fn(Session) -> P,
+        new: impl Fn(u16, u16, P) -> G,
+    ) -> Result<BenchmarkReport, GcError>
+    where
+        P: Preprocessor + Send,
+        G: Garbler + Send,
+        E: Evaluator<
+                Gc = G::Gc,
+                Label = F128b,
+                Decoder = <G::IM3 as InputMsg3>::Decoder,
+                OM1 = G::OM1,
+                OM2 = G::OM2,
+            >,
+        E::GarbledOutput: ExtractOutputMsg1<OM1 = G::OM1>,
+    {
+        let n = setup.len() as u16;
+        let (preps, rest): (Vec<_>, Vec<_>) = setup
+            .into_iter()
+            .map(|(prep, online, network)| (make_prep(prep), (online, network)))
+            .unzip();
+        let preps = run_prep(preps)?;
+        let parties = preps
+            .into_iter()
+            .zip(rest)
+            .enumerate()
+            .map(|(i, (prep, (online, network)))| SimParty {
+                garbler: new(i as u16, n, prep),
+                online,
+                network,
+            })
+            .collect_vec();
+        full_simulation::<G, E>(parties, circuit, true_inputs, true, None, None)
+    }
+
+    #[derive(Clone, Copy)]
+    enum Prep {
+        Insecure,
+        Secure,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Protocol {
+        Wrk17,
+        Copz,
+    }
+
+    fn run(
+        protocol: Protocol,
+        prep: Prep,
+        setup: Setup,
+        circuit: &NamedCircuit,
+        true_inputs: Vec<F2>,
+    ) -> Result<BenchmarkReport, GcError> {
+        let (bits, triples) = counts(circuit);
+        let seed: [u8; 32] = AesRng::new().r#gen();
+        let insecure = |s| InsecurePreprocessor::new(s, seed, true, bits, triples);
+        let secure = |s| {
+            SecurePreprocessor::new(
+                s,
+                &mut AesRng::new(),
+                true,
+                bits,
+                triples,
+                SecurePrepParams::default(),
+            )
+            .unwrap()
+        };
+        match (protocol, prep) {
+            (Protocol::Wrk17, Prep::Insecure) => simulate::<_, _, Wrk17Evaluator>(
+                setup,
+                circuit,
+                true_inputs,
+                insecure,
+                Wrk17Garbler::new,
+            ),
+            (Protocol::Wrk17, Prep::Secure) => simulate::<_, _, Wrk17Evaluator>(
+                setup,
+                circuit,
+                true_inputs,
+                secure,
+                Wrk17Garbler::new,
+            ),
+            (Protocol::Copz, Prep::Insecure) => simulate::<_, _, CopzEvaluator>(
+                setup,
+                circuit,
+                true_inputs,
+                insecure,
+                CopzGarbler::new,
+            ),
+            (Protocol::Copz, Prep::Secure) => simulate::<_, _, CopzEvaluator>(
+                setup,
+                circuit,
+                true_inputs,
+                secure,
+                CopzGarbler::new,
+            ),
+        }
+    }
+
+    fn basic_circuits_inputs() -> Vec<(&'static str, Vec<F2>)> {
+        vec![
+            ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ZERO, F2::ONE]),
+            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
+            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
+            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
+        ]
+    }
+
+    fn random_inputs(circuit: &NamedCircuit) -> Vec<F2> {
         let mut rng = AesRng::new();
-        let (preps, runner) = InsecurePreprocessor::new(
-            &mut rng,
-            num_parties,
-            true,
-            bits as usize,
-            triples as usize,
+        let input_length: u64 = circuit.input_sizes().iter().sum();
+        (0..input_length).map(|_| F2::random(&mut rng)).collect()
+    }
+
+    #[test]
+    fn test_basic_circuits() {
+        for protocol in [Protocol::Wrk17, Protocol::Copz] {
+            for prep in [Prep::Insecure, Prep::Secure] {
+                for (circuit_file, true_inputs) in basic_circuits_inputs() {
+                    let circuit = NamedCircuit::from_path(circuit_file);
+                    let parties = make_setup(4, LinkModel::default(), None);
+                    run(protocol, prep, parties, &circuit, true_inputs).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_two_parties() {
+        let circuit = NamedCircuit::from_path("circuits/and2.txt");
+        for protocol in [Protocol::Wrk17, Protocol::Copz] {
+            for prep in [Prep::Insecure, Prep::Secure] {
+                let parties = make_setup(2, LinkModel::default(), None);
+                run(protocol, prep, parties, &circuit, random_inputs(&circuit)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_wrk17_aes() {
+        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
+        for prep in [Prep::Insecure, Prep::Secure] {
+            let parties = make_setup(3, LinkModel::default(), None);
+            run(
+                Protocol::Wrk17,
+                prep,
+                parties,
+                &circuit,
+                random_inputs(&circuit),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_copz_aes() {
+        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
+        for prep in [Prep::Insecure, Prep::Secure] {
+            let parties = make_setup(3, LinkModel::default(), None);
+            run(
+                Protocol::Copz,
+                prep,
+                parties,
+                &circuit,
+                random_inputs(&circuit),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_report_with_latency() {
+        let circuit = NamedCircuit::from_path("circuits/and2.txt");
+        let latency = Duration::from_millis(20);
+        let parties = make_setup(
+            3,
+            LinkModel {
+                latency,
+                bandwidth: None,
+            },
             None,
         );
-        let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
+        let report = run(
+            Protocol::Copz,
+            Prep::Insecure,
+            parties,
+            &circuit,
+            random_inputs(&circuit),
+        )
+        .unwrap();
+        // at least the Beaver openings and three online rounds
+        assert!(report.total_duration() >= 4 * latency);
+        assert!(report.prep_bytes > 0);
+        assert!(report.online_bytes > 0);
+    }
 
-        let garblers = preps
-            .into_iter()
-            .enumerate()
-            .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
-            .collect_vec();
+    /// Flip a bit of the frame number `index` on the online stream from `from` to `to`.
+    fn flip(from: PartyId, to: PartyId, index: u64, offsets: Vec<usize>) -> Tamper {
+        let online = online_stream();
+        Arc::new(move |sender, receiver, stream, i, frame: &mut Vec<u8>| {
+            if sender == from && receiver == to && stream == online && i == index {
+                for offset in &offsets {
+                    frame[*offset] ^= 1;
+                }
+            }
+        })
+    }
 
-        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true, None, None);
+    #[test]
+    fn test_tampered_garbling_is_detected() {
+        let circuit = NamedCircuit::from_path("circuits/and.txt");
+        let n = 3;
+        // the first frame from garbler 0 to the evaluator is its garbled circuit,
+        // flip the first byte of every row (WRK17) or table (COPZ)
+        let wrk17_row = 1 + 16 * (n as usize - 1) + 16;
+        let tamper = flip(0, n - 1, 0, (0..4).map(|r| r * wrk17_row).collect());
+        let parties = make_setup(n, LinkModel::default(), Some(tamper));
+        let result = run(
+            Protocol::Wrk17,
+            Prep::Insecure,
+            parties,
+            &circuit,
+            random_inputs(&circuit),
+        );
+        assert!(
+            matches!(result, Err(GcError::MacCheckFailure)),
+            "{:?}",
+            result.err()
+        );
 
-        // shutdown
-        prep_handler.join().unwrap();
+        // The evaluator uses C1 only if the external value of the left input is 1, and
+        // then also uses C2, so flipping the same bit in C1 and C2 cancels out. We flip
+        // both C2 tables, one of which is always used.
+        let copz_table = 16 * (n as usize - 1);
+        let tamper = flip(0, n - 1, 0, vec![copz_table, 2 * copz_table]);
+        let parties = make_setup(n, LinkModel::default(), Some(tamper));
+        let result = run(
+            Protocol::Copz,
+            Prep::Insecure,
+            parties,
+            &circuit,
+            random_inputs(&circuit),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tampered_input_labels_are_detected() {
+        let circuit = NamedCircuit::from_path("circuits/and.txt");
+        let n = 3;
+        // frames from garbler 0 to the evaluator: garbled circuit, input message 1,
+        // the echo of the masked inputs, input message 3 (starting with the labels)
+        let tamper = flip(0, n - 1, 3, vec![0]);
+        let parties = make_setup(n, LinkModel::default(), Some(tamper));
+        let result = run(
+            Protocol::Wrk17,
+            Prep::Insecure,
+            parties,
+            &circuit,
+            random_inputs(&circuit),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_equivocating_evaluator_is_detected() {
+        let circuit = NamedCircuit::from_path("circuits/and2.txt");
+        let n = 3;
+        for protocol in [Protocol::Wrk17, Protocol::Copz] {
+            // the first frame from the evaluator to garbler 1 is the broadcast of the
+            // masked inputs, change the first masked input for garbler 1 only
+            let tamper = flip(n - 1, 1, 0, vec![0]);
+            let parties = make_setup(n, LinkModel::default(), Some(tamper));
+            let result = run(
+                protocol,
+                Prep::Insecure,
+                parties,
+                &circuit,
+                random_inputs(&circuit),
+            );
+            assert!(
+                matches!(result, Err(GcError::CheatDetected(_))),
+                "{:?}",
+                result.err()
+            );
+        }
+
+        // frames from the evaluator to garbler 1 in COPZ: masked inputs, echo,
+        // public part of output message 1 (starting with the external values)
+        let tamper = flip(n - 1, 1, 2, vec![0]);
+        let parties = make_setup(n, LinkModel::default(), Some(tamper));
+        let result = run(
+            Protocol::Copz,
+            Prep::Insecure,
+            parties,
+            &circuit,
+            random_inputs(&circuit),
+        );
+        assert!(
+            matches!(result, Err(GcError::CheatDetected(_))),
+            "{:?}",
+            result.err()
+        );
     }
 
     /// Garble `circuit` with the secure preprocessing and return the garblers' circuits.
-    fn garblings<G: Garbler + Send + 'static>(
+    fn garblings<G: Garbler + Send>(
         circuit: &NamedCircuit,
         num_parties: u16,
-        new: impl Fn(u16, SecurePreprocessor) -> G,
+        new: impl Fn(u16, u16, SecurePreprocessor) -> G,
     ) -> Vec<G::Gc>
     where
         G::Gc: Send,
     {
-        let mut garblers = secure_preps(circuit, num_parties, true)
+        let (bits, triples) = counts(circuit);
+        let preps = make_setup(num_parties, LinkModel::default(), None)
+            .into_iter()
+            .map(|(prep, _, _)| {
+                SecurePreprocessor::new(
+                    prep,
+                    &mut AesRng::new(),
+                    true,
+                    bits,
+                    triples,
+                    SecurePrepParams::default(),
+                )
+                .unwrap()
+            })
+            .collect_vec();
+        let mut garblers = run_prep(preps)
+            .unwrap()
             .into_iter()
             .enumerate()
-            .map(|(party_id, prep)| new(party_id as u16, prep))
+            .map(|(party_id, prep)| new(party_id as u16, num_parties, prep))
             .collect_vec();
         std::thread::scope(|s| {
             let handles = garblers
@@ -618,7 +822,7 @@ mod test {
                 .map(|g| {
                     s.spawn(|| {
                         let mut rng = AesRng::new();
-                        g.garble(&mut rng, &circuit.circuit)
+                        g.garble(&mut rng, &circuit.circuit).unwrap()
                     })
                 })
                 .collect_vec();
@@ -653,10 +857,10 @@ mod test {
     fn test_garbling_encoding() {
         let circuit = NamedCircuit::from_path("circuits/and2.txt");
         let n = 3;
-        let gcs = garblings(&circuit, n, |i, p| Wrk17Garbler::new(i, n, p));
+        let gcs = garblings(&circuit, n, Wrk17Garbler::new);
         check_garbling_encoding(&gcs, &circuit, n);
 
-        let gcs = garblings(&circuit, n, |i, p| CopzGarbler::new(i, n, p));
+        let gcs = garblings(&circuit, n, CopzGarbler::new);
         check_garbling_encoding(&gcs, &circuit, n);
         // only party 0 sends the bits b_w, so the senders cannot be confused
         let bytes0 = gcs[0].to_wire_bytes();
@@ -675,155 +879,5 @@ mod test {
         assert!(Wrk17InputMsg2::from_wire_bytes(&[0b111], &shape).is_ok());
         assert!(Wrk17InputMsg2::from_wire_bytes(&[0b1111], &shape).is_err());
         assert!(CopzInputMsg2::from_wire_bytes(&[0b1000], &shape).is_err());
-    }
-
-    /// Run the secure preprocessing for all parties.
-    fn secure_preps(
-        circuit: &NamedCircuit,
-        num_parties: u16,
-        tweak_delta_lsb: bool,
-    ) -> Vec<SecurePreprocessor> {
-        let input_wire_count: u64 = circuit.input_sizes().iter().sum();
-        let triples = circuit.nand();
-        let bits = circuit.nand() + input_wire_count;
-
-        let mut rng = AesRng::new();
-        let preps = SecurePreprocessor::new_in_memory(
-            &mut rng,
-            num_parties,
-            tweak_delta_lsb,
-            bits as usize,
-            triples as usize,
-            SecurePrepParams::default(),
-            None,
-        )
-        .unwrap();
-        run_prep(preps).unwrap()
-    }
-
-    fn run_wrk17_secure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
-        let garblers = secure_preps(circuit, num_parties, false)
-            .into_iter()
-            .enumerate()
-            .map(|(party_id, prep)| Wrk17Garbler::new(party_id as u16, num_parties, prep))
-            .collect_vec();
-        full_simulation::<_, Wrk17Evaluator, _>(garblers, circuit, true_inputs, true, None, None);
-    }
-
-    fn run_copz_secure_prep(circuit: &NamedCircuit, num_parties: u16, true_inputs: Vec<F2>) {
-        let garblers = secure_preps(circuit, num_parties, true)
-            .into_iter()
-            .enumerate()
-            .map(|(party_id, prep)| CopzGarbler::new(party_id as u16, num_parties, prep))
-            .collect_vec();
-        full_simulation::<_, CopzEvaluator, _>(garblers, circuit, true_inputs, true, None, None);
-    }
-
-    fn basic_circuits_inputs() -> Vec<(&'static str, Vec<F2>)> {
-        vec![
-            ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
-            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
-            ("circuits/and.txt", vec![F2::ZERO, F2::ONE]),
-            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
-            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
-        ]
-    }
-
-    #[test]
-    fn test_wrk17_secure_basic() {
-        for (circuit_file, true_inputs) in basic_circuits_inputs() {
-            let circuit = NamedCircuit::from_path(circuit_file);
-            run_wrk17_secure_prep(&circuit, 4, true_inputs);
-        }
-    }
-
-    #[test]
-    fn test_copz_secure_basic() {
-        for (circuit_file, true_inputs) in basic_circuits_inputs() {
-            let circuit = NamedCircuit::from_path(circuit_file);
-            run_copz_secure_prep(&circuit, 4, true_inputs);
-        }
-    }
-
-    #[test]
-    fn test_wrk17_secure_aes() {
-        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
-        let mut rng = AesRng::new();
-        let input_length: u64 = circuit.input_sizes().iter().sum();
-        let true_inputs = (0..input_length).map(|_| F2::random(&mut rng)).collect();
-        run_wrk17_secure_prep(&circuit, 3, true_inputs);
-    }
-
-    #[test]
-    fn test_copz_secure_aes() {
-        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
-        let mut rng = AesRng::new();
-        let input_length: u64 = circuit.input_sizes().iter().sum();
-        let true_inputs = (0..input_length).map(|_| F2::random(&mut rng)).collect();
-        run_copz_secure_prep(&circuit, 3, true_inputs);
-    }
-
-    #[test]
-    fn test_wrk17_aes() {
-        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
-        let num_parties = 3;
-
-        let input_length: u64 = circuit.input_sizes().iter().sum();
-        let true_inputs = vec![F2::ZERO; input_length as usize];
-        run_wrk17_insecure_prep(&circuit, num_parties, true_inputs);
-    }
-
-    #[test]
-    fn test_wrk17_basic() {
-        let circuits_inputs = vec![
-            ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
-            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
-            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
-            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
-        ];
-
-        for (circuit_file, true_inputs) in circuits_inputs {
-            let circuit = NamedCircuit::from_path(circuit_file);
-            let num_parties = 5;
-
-            run_wrk17_insecure_prep(&circuit, num_parties, true_inputs);
-        }
-    }
-
-    #[test]
-    fn test_copz_aes() {
-        let circuit = NamedCircuit::from_path("circuits/aes_128.txt");
-        let num_parties = 3;
-
-        let input_length: u64 = circuit.input_sizes().iter().sum();
-        let true_inputs = vec![F2::ZERO; input_length as usize];
-        run_copz_insecure_prep(&circuit, num_parties, true_inputs);
-    }
-
-    #[test]
-    fn test_copz_basic() {
-        let circuits_inputs = vec![
-            ("circuits/and.txt", vec![F2::ZERO, F2::ZERO]),
-            ("circuits/and.txt", vec![F2::ONE, F2::ONE]),
-            ("circuits/and.txt", vec![F2::ZERO, F2::ONE]),
-            ("circuits/and.txt", vec![F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ZERO, F2::ZERO, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ZERO]),
-            ("circuits/and2.txt", vec![F2::ONE, F2::ONE, F2::ONE]),
-            ("circuits/inv.txt", vec![F2::ONE, F2::ONE]),
-        ];
-
-        for (circuit_file, true_inputs) in circuits_inputs {
-            let circuit = NamedCircuit::from_path(circuit_file);
-            let num_parties = 5;
-
-            run_copz_insecure_prep(&circuit, num_parties, true_inputs);
-        }
     }
 }

@@ -3,12 +3,15 @@ use std::io::BufReader;
 use criterion::{Criterion, criterion_group, criterion_main};
 use itertools::Itertools;
 use multiparty_gc::{
-    NamedCircuit,
+    NamedCircuit, SimParty,
     evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
     full_simulation,
     garbler::{Garbler, copz::CopzGarbler, wrk17::Wrk17Garbler},
-    prep::{InsecureBenchPreprocessor, InsecurePreprocessor},
+    in_memory_setup,
+    net::memory::LinkModel,
+    prep::{InsecureBenchPreprocessor, InsecurePreprocessor, run_prep},
 };
+use rand::Rng;
 use scuttlebutt::{AesRng, ring::FiniteRing};
 use swanky_field_binary::F2;
 
@@ -28,25 +31,39 @@ macro_rules! bench_full_aes {
             let true_inputs = true_inputs.clone();
             b.iter(|| {
                 let mut rng = AesRng::new();
-                let (preps, runner) =
-                    InsecurePreprocessor::new(&mut rng, num_parties, true, bits, triples, None);
-                let prep_handler = std::thread::spawn(move || runner.run_blocking().unwrap());
-
-                let garblers = preps
+                let seed: [u8; 32] = rng.r#gen();
+                let mut parties = vec![];
+                for (party_id, setup) in in_memory_setup(num_parties, LinkModel::default())
+                    .unwrap()
                     .into_iter()
                     .enumerate()
-                    .map(|(party_id, prep)| <$garbler>::new(party_id as u16, num_parties, prep))
+                {
+                    let prep = InsecurePreprocessor::new(setup.prep, seed, true, bits, triples);
+                    parties.push((prep, setup.online, setup.network, party_id));
+                }
+                let (preps, rest): (Vec<_>, Vec<_>) = parties
+                    .into_iter()
+                    .map(|(prep, online, network, i)| (prep, (online, network, i)))
+                    .unzip();
+                let preps = run_prep(preps).unwrap();
+                let parties = preps
+                    .into_iter()
+                    .zip(rest)
+                    .map(|(prep, (online, network, i))| SimParty {
+                        garbler: <$garbler>::new(i as u16, num_parties, prep),
+                        online,
+                        network,
+                    })
                     .collect_vec();
-                let _ = full_simulation::<_, $evaluator, _>(
-                    garblers,
+                full_simulation::<_, $evaluator>(
+                    parties,
                     &circuit,
                     true_inputs.clone(),
                     false,
                     Some($bench_name.to_string()),
                     None,
-                );
-
-                prep_handler.join().unwrap()
+                )
+                .unwrap()
             })
         });
     }};

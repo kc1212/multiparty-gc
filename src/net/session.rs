@@ -112,6 +112,11 @@ impl Session {
         &self.label
     }
 
+    /// The stream that carries the messages of this session.
+    pub fn stream_id(&self) -> StreamId {
+        self.stream
+    }
+
     /// Create a sub-session, each label can only be used once per session.
     pub fn child(&self, label: &str) -> Result<Session, NetError> {
         Session::new(

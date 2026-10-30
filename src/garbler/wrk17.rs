@@ -61,6 +61,9 @@ impl<P: Preprocessor> Wrk17Garbler<P> {
     }
 }
 
+/// A label that is still encrypted with the MACs, see [Wrk17GarbledRow::decrypt_label_gamma].
+type EncryptedLabel = GenericArray<u8, <F128b as CanonicalSerialize>::ByteReprLen>;
+
 pub struct Wrk17GarbledRow {
     inner: Vec<u8>,
 }
@@ -137,10 +140,7 @@ impl Wrk17GarbledRow {
         row_id: u8,
         party_id: u16,
         party_count: u16,
-    ) -> (
-        GenericArray<u8, <F128b as CanonicalSerialize>::ByteReprLen>,
-        AuthShare<F2, F128b>,
-    ) {
+    ) -> Result<(EncryptedLabel, AuthShare<F2, F128b>), GcError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&label_a.to_bytes());
         hasher.update(&label_b.to_bytes());
@@ -162,7 +162,8 @@ impl Wrk17GarbledRow {
         // First read the byte and convert it to F2
         let mut r_buf = [0u8; 1];
         cursor.read_exact(&mut r_buf).unwrap();
-        let r = F2::from_bytes((&r_buf).into()).unwrap();
+        // a malicious garbler can make the share decrypt to anything
+        let r = F2::from_bytes((&r_buf).into()).map_err(|_| GcError::MacCheckFailure)?;
 
         // Second read the MACs
         // M_j[r^i_{\gamma, \ell}], i is fixed in every iteration, j \in [n] \ i
@@ -180,7 +181,7 @@ impl Wrk17GarbledRow {
         let mut enc_label_gamma_buf =
             GenericArray::<u8, <F128b as CanonicalSerialize>::ByteReprLen>::default();
         cursor.read_exact(&mut enc_label_gamma_buf).unwrap();
-        (enc_label_gamma_buf, r_share)
+        Ok((enc_label_gamma_buf, r_share))
     }
 
     fn decrypt_label_gamma(
@@ -275,7 +276,7 @@ pub(crate) fn decrypt_garbled_gate(
             row_id,
             party_id as u16,
             party_count as u16,
-        );
+        )?;
 
         // perform mac check:
         // r^i_{\gamma, \ell} * \Delta_1 + K_1[r^i_{\gamma, \ell}] = M_1[r^i_{\gamma, \ell}]
@@ -406,14 +407,16 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
         self.num_parties
     }
 
-    fn garble<R>(&mut self, rng: &mut R, circuit: &Circuit) -> Wrk17Garbling
+    const OUTPUT_CHECK: bool = false;
+
+    fn garble<R>(&mut self, rng: &mut R, circuit: &Circuit) -> Result<Wrk17Garbling, GcError>
     where
         R: Rng + CryptoRng,
     {
-        self.delta = self.preprocessor.init_delta().unwrap();
+        self.delta = self.preprocessor.init_delta()?;
 
         // these are the authenticated shares of the wire masks, indexed by the wire ID
-        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
+        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit)?;
         let mut wire_labels = self.gen_labels(rng, circuit);
 
         let and_gate_count = circuit.nand();
@@ -450,8 +453,7 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
             .collect_vec();
         let auth_prods = self
             .preprocessor
-            .beaver_mul(&auth_bits, &indicies_for_mul)
-            .unwrap();
+            .beaver_mul(&auth_bits, &indicies_for_mul)?;
 
         // garble the AND gates
         let mut and_gate_counter = 0usize;
@@ -582,17 +584,17 @@ impl<P: Preprocessor> Garbler for Wrk17Garbler<P> {
 
         if self.is_garbler() {
             // Keep some information for the output decoder
-            Wrk17Garbling::Garbler(garbler_output)
+            Ok(Wrk17Garbling::Garbler(garbler_output))
         } else {
             debug_assert_eq!(nwires as usize, auth_bits.len());
-            Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
+            Ok(Wrk17Garbling::Evaluator(Wrk17EvaluatorOutput {
                 total_num_parties: self.num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
                     .map(|i| auth_bits[i as usize].clone())
                     .collect(),
                 delta: self.delta,
-            })
+            }))
         }
     }
 
@@ -827,8 +829,9 @@ mod tests {
             0,
         );
 
-        let (mut enc_label, recovered_share) =
-            row.extract_macs_and_label_gamma(label_a_0, label_b_0, gate_id, 0, party_id as u16, n);
+        let (mut enc_label, recovered_share) = row
+            .extract_macs_and_label_gamma(label_a_0, label_b_0, gate_id, 0, party_id as u16, n)
+            .unwrap();
 
         let macs_on_share_0 = shares
             .iter()

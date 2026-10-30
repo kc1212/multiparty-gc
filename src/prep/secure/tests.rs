@@ -1,3 +1,5 @@
+use itertools::Itertools;
+
 use crate::{prep::run_prep, sharing::verify_and_reconstruct, transpose};
 
 use super::*;
@@ -9,7 +11,7 @@ fn new_preps(
     params: SecurePrepParams,
 ) -> Vec<SecurePreprocessor> {
     let mut rng = AesRng::new();
-    SecurePreprocessor::new_in_memory(&mut rng, n, true, bits, triples, params, None).unwrap()
+    SecurePreprocessor::new_in_memory(&mut rng, n, true, bits, triples, params).unwrap()
 }
 
 /// Run `f` for every party concurrently.
@@ -72,22 +74,13 @@ fn test_constructor_rejects_overflow_before_allocating() {
     let mut rng = AesRng::new();
     for (bits, triples) in [(usize::MAX, 0), (0, usize::MAX), (0, usize::MAX / 4)] {
         assert!(matches!(
-            SecurePreprocessor::new_in_memory(
-                &mut rng,
-                2,
-                true,
-                bits,
-                triples,
-                Default::default(),
-                None
-            ),
+            SecurePreprocessor::new_in_memory(&mut rng, 2, true, bits, triples, Default::default()),
             Err(GcError::InvalidPrepParams(_))
         ));
     }
     for n in [0, 1] {
         assert!(
-            SecurePreprocessor::new_in_memory(&mut rng, n, true, 0, 0, Default::default(), None)
-                .is_err()
+            SecurePreprocessor::new_in_memory(&mut rng, n, true, 0, 0, Default::default()).is_err()
         );
     }
 }

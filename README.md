@@ -24,22 +24,33 @@ cargo run --release -- -h
 
 Two preprocessors implement the same `Preprocessor` trait (see `src/prep`):
 
-- `InsecurePreprocessor` (default, `--prep insecure`): a trusted dealer, only
-  meant for benchmarking the garbling.
+- `InsecurePreprocessor` (default, `--prep insecure`): a simulated trusted
+  dealer, every party derives the material of all parties from a shared seed.
+  Only meant for benchmarking the garbling.
 - `SecurePreprocessor` (`--prep secure`): the maliciously secure preprocessing
   of [WRK17](https://eprint.iacr.org/2017/189) following
   [emp-agmpc](https://github.com/emp-toolkit/emp-agmpc). It uses KOS correlated
   OT from `ocelot`, the Π_aBit^n / Π_aShare consistency checks, Π_LaAND leaky
   AND triples and bucketing. Values that the paper broadcasts use echo
-  broadcast and every opening is MAC-checked. Parties communicate over
-  in-process channels. The statistical security parameter can be set with
-  `--rho` (1–128, default 40). Bucket sizes are derived from this parameter and
-  the actual triple count; `--bucket-size` may increase the calculated minimum,
-  but smaller sizes are rejected. The constructor returns an error for invalid
-  parameters or overflowing material sizes.
+  broadcast and every opening is MAC-checked. The statistical security
+  parameter can be set with `--rho` (1–128, default 40). Bucket sizes are
+  derived from this parameter and the actual triple count; `--bucket-size` may
+  increase the calculated minimum, but smaller sizes are rejected. The
+  constructor returns an error for invalid parameters or overflowing material
+  sizes.
 
-The time of the function-independent preprocessing is reported in the
-`prep_duration` column and is not part of `total_duration`.
+## Networking
+
+All communication goes through the session-based network layer in `src/net`.
+Every party runs `driver::run_party`, the preprocessor uses its own session.
+The command line tool runs all parties in one process over the in-memory
+transport; `--latency-ms` and `--bandwidth-mbps` set the one-way latency and
+bandwidth of every link.
+
+The CSV output reports `prep_duration` (the function-independent
+preprocessing, not part of `total_duration`), and the bytes sent by all
+parties on the preprocessing session (`prep_bytes`, which includes the
+openings during garbling) and in the online phase (`online_bytes`).
 
 ## Profiling
 

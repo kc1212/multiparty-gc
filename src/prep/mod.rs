@@ -1,9 +1,13 @@
 use itertools::Itertools;
 use itertools::izip;
+use scuttlebutt::ring::FiniteRing;
+use scuttlebutt::serialization::CanonicalSerialize;
 use swanky_field_binary::F2;
 use swanky_field_binary::F128b;
 
 use crate::error::GcError;
+use crate::net::Bits;
+use crate::net::Session;
 use crate::sharing::AuthShare;
 
 pub mod insecure;
@@ -11,7 +15,6 @@ pub mod secure;
 
 pub use insecure::InsecureBenchPreprocessor;
 pub use insecure::InsecurePreprocessor;
-pub use insecure::InsecurePreprocessorRunner;
 pub use secure::SecurePrepParams;
 pub use secure::SecurePreprocessor;
 
@@ -108,4 +111,85 @@ pub fn run_prep<P: Preprocessor + Send>(mut preps: Vec<P>) -> Result<Vec<P>, GcE
     });
     results.into_iter().collect::<Result<Vec<_>, _>>()?;
     Ok(preps)
+}
+
+/// Open authenticated shares to `receiver_party` with a MAC check.
+///
+/// Every party sends its shares together with a digest of its MACs under the receiver's
+/// global key, and each receiver checks the digest against its keys. Returns `None`
+/// if we are not a receiver. If `tamper` is set, we flip our first share, this is only
+/// useful to simulate cheating in tests.
+pub(crate) fn open_with_mac_check(
+    session: &mut Session,
+    delta: F128b,
+    receiver_party: ReceiverParty,
+    xs: &[AuthShare<F2, F128b>],
+    tamper: bool,
+) -> Result<Option<Vec<F2>>, GcError> {
+    let me = session.party_id();
+    let n = session.party_count();
+    if let ReceiverParty::Party(receiver) = receiver_party
+        && receiver >= n
+    {
+        return Err(GcError::WrongOpening(format!(
+            "invalid receiver {receiver}"
+        )));
+    }
+    if xs.iter().any(|x| {
+        x.party_id != me || x.mac_keys.len() != n as usize || x.mac_values.len() != n as usize
+    }) {
+        return Err(GcError::WrongOpening(
+            "invalid authenticated share shape or owner".into(),
+        ));
+    }
+    let is_receiver = |j: u16| match receiver_party {
+        ReceiverParty::All => true,
+        ReceiverParty::Party(r) => r == j,
+    };
+
+    let mut my_shares = Bits(xs.iter().map(|x| bool::from(x.share)).collect());
+    if tamper && !xs.is_empty() {
+        my_shares.0[0] ^= true;
+    }
+    for peer in session.peers() {
+        if is_receiver(peer) {
+            let digest = mac_digest(
+                session.sid(),
+                xs.iter().map(|x| x.mac_values[peer as usize]),
+            );
+            session.send_msg(peer, &(my_shares.clone(), digest))?;
+        }
+    }
+    if !is_receiver(me) {
+        return Ok(None);
+    }
+
+    let mut output = xs.iter().map(|x| bool::from(x.share)).collect_vec();
+    for peer in session.peers() {
+        let (Bits(shares), digest): (Bits, [u8; blake3::OUT_LEN]) =
+            session.recv_msg(peer, &(xs.len(), ()))?;
+        let expected = mac_digest(
+            session.sid(),
+            xs.iter()
+                .zip(&shares)
+                .map(|(x, s)| x.mac_keys[peer as usize] + if *s { delta } else { F128b::ZERO }),
+        );
+        if expected != digest {
+            return Err(GcError::MacCheckFailure);
+        }
+        for (o, s) in output.iter_mut().zip(shares) {
+            *o ^= s;
+        }
+    }
+    Ok(Some(output.into_iter().map(F2::from).collect()))
+}
+
+/// Digest of the MACs of opened shares, bound to the session.
+fn mac_digest(sid: &[u8; 32], macs: impl Iterator<Item = F128b>) -> [u8; blake3::OUT_LEN] {
+    let mut hasher = blake3::Hasher::new_derive_key("multiparty-gc opening macs v1");
+    hasher.update(sid);
+    for mac in macs {
+        hasher.update(&mac.to_bytes());
+    }
+    *hasher.finalize().as_bytes()
 }

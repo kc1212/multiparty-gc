@@ -20,10 +20,17 @@ pub trait Garbler {
     type IM1: InputMsg1 + Wire<Shape = MsgShape>;
     type IM2: InputMsg2 + Clone + Wire<Shape = MsgShape>;
     type IM3: InputMsg3 + Wire<Shape = MsgShape>;
-    type OM1: OutputMsg1 + Wire<Shape = MsgShape>;
+    type OM1: OutputMsg1;
     type OM2: OutputMsg2 + Wire<Shape = MsgShape>;
 
-    fn garble<R: Rng + CryptoRng>(&mut self, rng: &mut R, circuit: &Circuit) -> Self::Gc;
+    /// Whether the protocol has an output check round, see [Garbler::check_output_msg1].
+    const OUTPUT_CHECK: bool;
+
+    fn garble<R: Rng + CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        circuit: &Circuit,
+    ) -> Result<Self::Gc, GcError>;
     fn party_id(&self) -> u16;
     fn num_parties(&self) -> u16;
 
@@ -83,12 +90,12 @@ pub trait Garbling {
 pub(crate) fn auth_bits_from_prep<P: Preprocessor>(
     prep: &mut P,
     circuit: &Circuit,
-) -> Vec<AuthShare<F2, F128b>> {
+) -> Result<Vec<AuthShare<F2, F128b>>, GcError> {
     let input_wire_count: u64 = circuit.input_sizes().iter().sum();
     let and_gate_count = circuit.nand();
 
     // Sample wire masks and labels for input wires
-    let mut unindexed_auth_bits = prep.auth_bits(input_wire_count + and_gate_count).unwrap();
+    let mut unindexed_auth_bits = prep.auth_bits(input_wire_count + and_gate_count)?;
     let mut auth_bits = vec![AuthShare::<F2, F128b>::make_empty(); circuit.nwires() as usize];
     auth_bits
         .iter_mut()
@@ -105,7 +112,7 @@ pub(crate) fn auth_bits_from_prep<P: Preprocessor>(
         }
     }
     debug_assert!(unindexed_auth_bits.is_empty());
-    auth_bits
+    Ok(auth_bits)
 }
 
 pub(crate) fn process_linear_gates(

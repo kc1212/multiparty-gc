@@ -31,8 +31,27 @@ pub struct CopzOutputMsg1 {
 }
 
 impl OutputMsg1 for CopzOutputMsg1 {
+    type Public = CopzOutputMsg1Public;
+    type Private = CopzOutputMsg1Private;
+
     fn chi(&self) -> [u8; 32] {
         self.chi
+    }
+
+    fn split(self) -> (CopzOutputMsg1Public, CopzOutputMsg1Private) {
+        let Self { w_hats, h, chi } = self;
+        (
+            CopzOutputMsg1Public { w_hats, chi },
+            CopzOutputMsg1Private { h },
+        )
+    }
+
+    fn join(public: CopzOutputMsg1Public, private: CopzOutputMsg1Private) -> Self {
+        Self {
+            w_hats: public.w_hats,
+            h: private.h,
+            chi: public.chi,
+        }
     }
 }
 
@@ -431,10 +450,16 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         self.num_parties
     }
 
-    fn garble<R: Rng + CryptoRng>(&mut self, rng: &mut R, circuit: &Circuit) -> CopzGarbling {
+    const OUTPUT_CHECK: bool = true;
+
+    fn garble<R: Rng + CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        circuit: &Circuit,
+    ) -> Result<CopzGarbling, GcError> {
         // Get the deltas, make sure lsb(\Delta_2) = 1
         // This translates to delta of party_id = 0 since evaluator is party n-1
-        self.delta = self.preprocessor.init_delta().unwrap();
+        self.delta = self.preprocessor.init_delta()?;
 
         #[cfg(test)]
         {
@@ -443,7 +468,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
             }
         }
 
-        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit);
+        let mut auth_bits = auth_bits_from_prep(&mut self.preprocessor, circuit)?;
         let mut wire_labels = self.gen_labels(rng, circuit);
 
         let and_gate_count = circuit.nand();
@@ -489,8 +514,7 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
             .collect_vec();
         let auth_prods = self
             .preprocessor
-            .beaver_mul(&auth_bits, &indicies_for_mul)
-            .unwrap();
+            .beaver_mul(&auth_bits, &indicies_for_mul)?;
 
         let mut and_gate_counter = 0usize;
         for gate in circuit.gates() {
@@ -577,20 +601,20 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
 
         if self.is_garbler() {
             if self.party_id == 0 {
-                CopzGarbling::Garbler((garbler_output, Some(b_w_output)))
+                Ok(CopzGarbling::Garbler((garbler_output, Some(b_w_output))))
             } else {
-                CopzGarbling::Garbler((garbler_output, None))
+                Ok(CopzGarbling::Garbler((garbler_output, None)))
             }
         } else {
             debug_assert_eq!(nwires as usize, auth_bits.len());
-            CopzGarbling::Evaluator(CopzEvaluatorOutput {
+            Ok(CopzGarbling::Evaluator(CopzEvaluatorOutput {
                 num_parties: self.num_parties,
                 garbling_shares: eval_output,
                 wire_mask_shares: (nwires - output_wire_count..nwires)
                     .map(|i| auth_bits[i as usize].clone())
                     .collect(),
                 delta: self.delta,
-            })
+            }))
         }
     }
 
@@ -837,24 +861,52 @@ impl Wire for CopzInputMsg3 {
     }
 }
 
-impl Wire for CopzOutputMsg1 {
+/// The part of [CopzOutputMsg1] that the evaluator broadcasts: `chi` and the
+/// external values of the AND gates.
+pub struct CopzOutputMsg1Public {
+    w_hats: Vec<F2>,
+    chi: [u8; 32],
+}
+
+/// The part of [CopzOutputMsg1] that is sent to one garbler: the hash of its labels.
+pub struct CopzOutputMsg1Private {
+    h: [u8; 32],
+}
+
+impl Wire for CopzOutputMsg1Public {
     type Shape = MsgShape;
 
     fn encoded_len(shape: &MsgShape) -> usize {
-        <(Bits, [u8; 32], [u8; 32])>::encoded_len(&(shape.and_gates, (), ()))
+        <(Bits, [u8; 32])>::encoded_len(&(shape.and_gates, ()))
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
         Bits::from_f2(&self.w_hats).encode(out);
-        self.h.encode(out);
         self.chi.encode(out);
     }
 
     fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
         Ok(Self {
             w_hats: Bits::decode(reader, &shape.and_gates)?.into_f2(),
-            h: Wire::decode(reader, &())?,
             chi: Wire::decode(reader, &())?,
+        })
+    }
+}
+
+impl Wire for CopzOutputMsg1Private {
+    type Shape = MsgShape;
+
+    fn encoded_len(_: &MsgShape) -> usize {
+        32
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.h.encode(out);
+    }
+
+    fn decode(reader: &mut Reader<'_>, _: &MsgShape) -> Result<Self, WireError> {
+        Ok(Self {
+            h: Wire::decode(reader, &())?,
         })
     }
 }
