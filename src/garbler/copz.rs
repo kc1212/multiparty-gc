@@ -8,8 +8,16 @@ use scuttlebutt::{ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    InputMsg1, InputMsg2, InputMsg3, OutputMsg1, OutputMsg2, error::GcError,
-    garbler::auth_bits_from_prep, prep::Preprocessor, sharing::AuthShare, universal_hash,
+    InputMsg1, InputMsg2, InputMsg3, MsgShape, OutputMsg1, OutputMsg2,
+    error::GcError,
+    garbler::auth_bits_from_prep,
+    net::{
+        Bits, Wire,
+        wire::{Reader, WireError},
+    },
+    prep::Preprocessor,
+    sharing::AuthShare,
+    universal_hash,
 };
 
 use super::{Garbler, Garbling, process_linear_gates};
@@ -713,6 +721,159 @@ impl<P: Preprocessor> Garbler for CopzGarbler<P> {
         let z_i = universal_hash(&chi, &t_g_delta_1);
 
         Ok(CopzOutputMsg2 { z_i })
+    }
+}
+
+/// Length of one encrypted table: the label share and the shares for the other garblers.
+fn copz_table_len(party_count: u16) -> usize {
+    16 * (party_count as usize - 1)
+}
+
+/// Only the garblers send their garbling, decoding always returns [CopzGarbling::Garbler].
+/// Party 0 (P2 in the paper) additionally sends the bits `b_w` for every AND gate.
+impl Wire for CopzGarbling {
+    type Shape = MsgShape;
+
+    fn encoded_len(shape: &MsgShape) -> usize {
+        let b_w_len = if shape.sender == 0 {
+            Bits::encoded_len(&shape.and_gates)
+        } else {
+            0
+        };
+        shape
+            .and_gates
+            .saturating_mul(3 * copz_table_len(shape.party_count))
+            .saturating_add(b_w_len)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            CopzGarbling::Garbler((gates, b_w)) => {
+                for gate in gates {
+                    for table in &gate.inner {
+                        out.extend_from_slice(table);
+                    }
+                }
+                if let Some(b_w) = b_w {
+                    Bits::from_f2(b_w).encode(out);
+                }
+            }
+            CopzGarbling::Evaluator(_) => panic!("the evaluator's garbling is never sent"),
+        }
+    }
+
+    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
+        let table_len = copz_table_len(shape.party_count);
+        let gates = (0..shape.and_gates)
+            .map(|_| {
+                let mut table = || -> Result<_, WireError> { Ok(reader.take(table_len)?.to_vec()) };
+                Ok(CopzGarbledGate {
+                    inner: [table()?, table()?, table()?],
+                })
+            })
+            .collect::<Result<_, WireError>>()?;
+        let b_w = if shape.sender == 0 {
+            Some(Bits::decode(reader, &shape.and_gates)?.into_f2())
+        } else {
+            None
+        };
+        Ok(CopzGarbling::Garbler((gates, b_w)))
+    }
+}
+
+impl Wire for CopzInputMsg1 {
+    type Shape = MsgShape;
+
+    fn encoded_len(shape: &MsgShape) -> usize {
+        Bits::encoded_len(&shape.inputs)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        Bits::from_f2(&self.shares).encode(out);
+    }
+
+    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
+        Ok(Self {
+            shares: Bits::decode(reader, &shape.inputs)?.into_f2(),
+        })
+    }
+}
+
+impl Wire for CopzInputMsg2 {
+    type Shape = MsgShape;
+
+    fn encoded_len(shape: &MsgShape) -> usize {
+        Bits::encoded_len(&shape.inputs)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        Bits::from_f2(&self.masked_inputs).encode(out);
+    }
+
+    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
+        Ok(Self {
+            masked_inputs: Bits::decode(reader, &shape.inputs)?.into_f2(),
+        })
+    }
+}
+
+impl Wire for CopzInputMsg3 {
+    type Shape = MsgShape;
+
+    fn encoded_len(shape: &MsgShape) -> usize {
+        <(Vec<F128b>, Bits)>::encoded_len(&((shape.inputs, ()), shape.outputs))
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.labels.encode(out);
+        Bits::from_f2(&self.output_decoder).encode(out);
+    }
+
+    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
+        Ok(Self {
+            labels: Vec::decode(reader, &(shape.inputs, ()))?,
+            output_decoder: Bits::decode(reader, &shape.outputs)?.into_f2(),
+        })
+    }
+}
+
+impl Wire for CopzOutputMsg1 {
+    type Shape = MsgShape;
+
+    fn encoded_len(shape: &MsgShape) -> usize {
+        <(Bits, [u8; 32], [u8; 32])>::encoded_len(&(shape.and_gates, (), ()))
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        Bits::from_f2(&self.w_hats).encode(out);
+        self.h.encode(out);
+        self.chi.encode(out);
+    }
+
+    fn decode(reader: &mut Reader<'_>, shape: &MsgShape) -> Result<Self, WireError> {
+        Ok(Self {
+            w_hats: Bits::decode(reader, &shape.and_gates)?.into_f2(),
+            h: Wire::decode(reader, &())?,
+            chi: Wire::decode(reader, &())?,
+        })
+    }
+}
+
+impl Wire for CopzOutputMsg2 {
+    type Shape = MsgShape;
+
+    fn encoded_len(_: &MsgShape) -> usize {
+        F128b::encoded_len(&())
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.z_i.encode(out);
+    }
+
+    fn decode(reader: &mut Reader<'_>, _: &MsgShape) -> Result<Self, WireError> {
+        Ok(Self {
+            z_i: F128b::decode(reader, &())?,
+        })
     }
 }
 

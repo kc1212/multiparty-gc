@@ -132,17 +132,6 @@ impl Evaluator for Wrk17Evaluator {
                             "Evaluating {and_gate_ctr}-th AND gate with a={a}, masked_a={:?}, b={b}, masked_b={:?}, gamma={out}",
                             alpha, beta
                         );
-                        let mut row0 = self.garbling_shares[and_gate_ctr][0].share;
-                        let mut row1 = self.garbling_shares[and_gate_ctr][1].share;
-                        let mut row2 = self.garbling_shares[and_gate_ctr][2].share;
-                        let mut row3 = self.garbling_shares[and_gate_ctr][3].share;
-                        for row in &garblings[and_gate_ctr] {
-                            row0 += row.unencrypted_rows[0].share;
-                            row1 += row.unencrypted_rows[1].share;
-                            row2 += row.unencrypted_rows[2].share;
-                            row3 += row.unencrypted_rows[3].share;
-                        }
-                        println!("\trows: ({row0:?}, {row1:?}, {row2:?}, {row3:?})");
                         println!(
                             "\tlabels: {:?}, {:?}",
                             labels[*a as usize], labels[*b as usize]

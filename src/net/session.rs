@@ -5,7 +5,10 @@ use std::sync::Arc;
 use rand::{CryptoRng, Rng};
 use scuttlebutt::AbstractChannel;
 
-use super::{NetError, NetInner, PartyId, StatsCell, StreamId};
+use super::{
+    NetError, NetInner, PartyId, StatsCell, StreamId,
+    wire::{PerParty, Wire},
+};
 
 /// Length of a commitment, see [Session::commit].
 pub const COMMITMENT_LEN: usize = 32;
@@ -374,6 +377,118 @@ impl Session {
         Ok(*hasher.finalize().as_bytes())
     }
 
+    /// Send a typed message to `to`.
+    pub fn send_msg<T: Wire>(&mut self, to: PartyId, msg: &T) -> Result<(), NetError> {
+        let result = self.send_raw(to, msg.to_wire_bytes());
+        self.check(result)
+    }
+
+    /// Receive a typed message of the given shape from `from`.
+    pub fn recv_msg<T: Wire>(&mut self, from: PartyId, shape: &T::Shape) -> Result<T, NetError> {
+        let result = self
+            .recv_raw(from, T::encoded_len(shape))
+            .and_then(|bytes| decode_from(from, &bytes, shape));
+        self.check(result)
+    }
+
+    /// Send `msg_for(j)` to every peer `j` and receive a message of the given shape from
+    /// every peer.
+    pub fn exchange_msg<T: Wire>(
+        &mut self,
+        mut msg_for: impl FnMut(PartyId) -> T,
+        shape: &T::Shape,
+    ) -> Result<PerParty<T>, NetError> {
+        let msgs = (0..self.party_count())
+            .map(|j| {
+                if j == self.party_id() {
+                    vec![]
+                } else {
+                    msg_for(j).to_wire_bytes()
+                }
+            })
+            .collect::<Vec<_>>();
+        let result = self
+            .exchange_inner(&msgs, T::encoded_len(shape))
+            .and_then(|received| self.decode_all(received, shape, false));
+        let items = self.check(result)?;
+        Ok(PerParty::new(self.party_id(), items))
+    }
+
+    /// Typed version of [Self::broadcast_all], the output includes our own message.
+    pub fn broadcast_all_msg<T: Wire>(
+        &mut self,
+        msg: &T,
+        shape: &T::Shape,
+    ) -> Result<Vec<T>, NetError> {
+        let bytes = msg.to_wire_bytes();
+        let result = self.broadcast_all_typed(&bytes, |_| bytes.clone(), shape);
+        self.check(result)
+    }
+
+    /// Typed version of [Self::broadcast_all_with], only useful in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn broadcast_all_msg_with<T: Wire>(
+        &mut self,
+        msg: &T,
+        msg_for: impl Fn(PartyId) -> T,
+        shape: &T::Shape,
+    ) -> Result<Vec<T>, NetError> {
+        let bytes = msg.to_wire_bytes();
+        let result = self.broadcast_all_typed(&bytes, |j| msg_for(j).to_wire_bytes(), shape);
+        self.check(result)
+    }
+
+    fn broadcast_all_typed<T: Wire>(
+        &mut self,
+        bytes: &[u8],
+        msg_for: impl Fn(PartyId) -> Vec<u8>,
+        shape: &T::Shape,
+    ) -> Result<Vec<T>, NetError> {
+        if bytes.len() != T::encoded_len(shape) {
+            return Err(NetError::Config("message does not match its shape".into()));
+        }
+        let received = self.broadcast_all_inner(bytes, msg_for)?;
+        Ok(self
+            .decode_all(received, shape, true)?
+            .into_iter()
+            .map(|x| x.expect("all messages are present"))
+            .collect())
+    }
+
+    /// Typed version of [Self::broadcast_from].
+    pub fn broadcast_from_msg<T: Wire>(
+        &mut self,
+        sender: PartyId,
+        msg: Option<&T>,
+        shape: &T::Shape,
+    ) -> Result<T, NetError> {
+        let bytes = msg.map(|msg| msg.to_wire_bytes());
+        let result = self
+            .broadcast_from_inner(sender, bytes.as_deref(), T::encoded_len(shape))
+            .and_then(|bytes| decode_from(sender, &bytes, shape));
+        self.check(result)
+    }
+
+    /// Decode the messages of all peers, and our own if `include_self` is set.
+    fn decode_all<T: Wire>(
+        &self,
+        received: Vec<Vec<u8>>,
+        shape: &T::Shape,
+        include_self: bool,
+    ) -> Result<Vec<Option<T>>, NetError> {
+        received
+            .into_iter()
+            .enumerate()
+            .map(|(j, bytes)| {
+                if j == self.party_id() as usize && !include_self {
+                    Ok(None)
+                } else {
+                    decode_from(j as PartyId, &bytes, shape).map(Some)
+                }
+            })
+            .collect()
+    }
+
     /// One byte stream per peer, e.g., to run two-party protocols such as OT.
     ///
     /// The channels use their own stream, so they never interfere with the messages
@@ -399,6 +514,13 @@ impl Session {
             })
             .collect())
     }
+}
+
+fn decode_from<T: Wire>(party: PartyId, bytes: &[u8], shape: &T::Shape) -> Result<T, NetError> {
+    T::from_wire_bytes(bytes, shape).map_err(|err| NetError::Malformed {
+        party,
+        reason: err.0,
+    })
 }
 
 /// A byte stream to one peer that implements [AbstractChannel].

@@ -4,20 +4,24 @@ use scuttlebutt::ring::FiniteRing;
 use swanky_field_binary::{F2, F128b};
 
 use crate::{
-    InputMsg1, InputMsg2, InputMsg3, OutputMsg1, OutputMsg2, error::GcError, prep::Preprocessor,
-    sharing::AuthShare,
+    InputMsg1, InputMsg2, InputMsg3, MsgShape, OutputMsg1, OutputMsg2, error::GcError, net::Wire,
+    prep::Preprocessor, sharing::AuthShare,
 };
 
 pub mod copz;
 pub mod wrk17;
 
+/// A party in the garbling protocol, every party including the evaluator garbles.
+///
+/// The methods are message-in/message-out, every message that is sent to another party
+/// has a [Wire] encoding whose shape is the [MsgShape] with the sender of the message.
 pub trait Garbler {
-    type Gc: Garbling;
-    type IM1: InputMsg1;
-    type IM2: InputMsg2 + Clone;
-    type IM3: InputMsg3;
-    type OM1: OutputMsg1;
-    type OM2: OutputMsg2;
+    type Gc: Garbling + Wire<Shape = MsgShape>;
+    type IM1: InputMsg1 + Wire<Shape = MsgShape>;
+    type IM2: InputMsg2 + Clone + Wire<Shape = MsgShape>;
+    type IM3: InputMsg3 + Wire<Shape = MsgShape>;
+    type OM1: OutputMsg1 + Wire<Shape = MsgShape>;
+    type OM2: OutputMsg2 + Wire<Shape = MsgShape>;
 
     fn garble<R: Rng + CryptoRng>(&mut self, rng: &mut R, circuit: &Circuit) -> Self::Gc;
     fn party_id(&self) -> u16;

@@ -13,12 +13,39 @@ use rand::{CryptoRng, Rng, SeedableRng};
 use scuttlebutt::{AesRng, ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
+use crate::net::Wire;
+
 pub mod error;
 pub mod evaluator;
 pub mod garbler;
 pub mod net;
 pub mod prep;
 pub mod sharing;
+
+/// Public parameters that determine the size of every protocol message,
+/// `sender` is the party that sends the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsgShape {
+    pub party_count: u16,
+    pub sender: u16,
+    /// Number of circuit input wires.
+    pub inputs: usize,
+    /// Number of circuit output wires.
+    pub outputs: usize,
+    pub and_gates: usize,
+}
+
+impl MsgShape {
+    pub fn new(circuit: &Circuit, party_count: u16, sender: u16) -> Self {
+        Self {
+            party_count,
+            sender,
+            inputs: circuit.input_sizes().iter().sum::<u64>() as usize,
+            outputs: circuit.output_sizes().iter().sum::<u64>() as usize,
+            and_gates: circuit.nand() as usize,
+        }
+    }
+}
 
 pub trait InputMsg1 {}
 
@@ -53,6 +80,20 @@ impl OutputMsg1 for DummyOutput {
 }
 
 impl OutputMsg2 for DummyOutput {}
+
+impl Wire for DummyOutput {
+    type Shape = MsgShape;
+
+    fn encoded_len(_: &MsgShape) -> usize {
+        0
+    }
+
+    fn encode(&self, _: &mut Vec<u8>) {}
+
+    fn decode(_: &mut net::wire::Reader<'_>, _: &MsgShape) -> Result<Self, net::wire::WireError> {
+        Ok(DummyOutput)
+    }
+}
 
 pub(crate) fn transpose<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
     debug_assert!(!v.is_empty());
@@ -90,6 +131,11 @@ pub fn universal_hash(chi: &[u8; 32], elements: &[F128b]) -> F128b {
         .zip(xs)
         .map(|(e, x)| e * x)
         .fold(F128b::ZERO, |acc, x| acc + x)
+}
+
+/// Encode and decode `msg` as if it was sent over the network by `shape.sender`.
+fn relay<T: Wire<Shape = MsgShape>>(msg: T, shape: &MsgShape) -> T {
+    T::from_wire_bytes(&msg.to_wire_bytes(), shape).expect("honest messages always decode")
 }
 
 pub struct EvaluationMaterial<E: Evaluator> {
@@ -153,12 +199,21 @@ where
 
     let final_garbler = garblers.pop().unwrap();
     let evaluator_gc = gcs.pop().unwrap();
+    let party_count = final_garbler.num_parties();
+    let evaluator_id = party_count - 1;
+    let shape = |sender| MsgShape::new(circuit, party_count, sender);
+    // the garblers send their garbled circuits to the evaluator
+    let gcs = gcs
+        .into_iter()
+        .enumerate()
+        .map(|(i, gc)| relay(gc, &shape(i as u16)))
+        .collect_vec();
 
     // do the first round of communication
     // the garblers (n-1 of them) send a message to the evaluator
     let msgs_round1 = garblers
         .iter()
-        .map(|garbler| garbler.input_round_1())
+        .map(|garbler| relay(garbler.input_round_1(), &shape(garbler.party_id())))
         .collect_vec();
     if let Some(dur) = latency {
         std::thread::sleep(dur);
@@ -168,7 +223,10 @@ where
     // the evaluator processes the messages and then creates the response
     let msgs_round2 = final_garbler
         .input_round_2(true_inputs, msgs_round1)
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|msg| relay(msg, &shape(evaluator_id)))
+        .collect_vec();
     let masked_inputs = msgs_round2[0].clone().into_masked_inputs();
     if let Some(dur) = latency {
         std::thread::sleep(dur);
@@ -178,7 +236,9 @@ where
     let (msgs_round3, decoder): (Vec<Vec<F128b>>, Vec<_>) = garblers
         .iter()
         .zip(msgs_round2)
-        .map(|(garbler, msg)| garbler.input_round_3(msg).into_labels_and_decoder())
+        .map(|(garbler, msg)| {
+            relay(garbler.input_round_3(msg), &shape(garbler.party_id())).into_labels_and_decoder()
+        })
         .unzip();
     if let Some(dur) = latency {
         std::thread::sleep(dur);
@@ -234,7 +294,13 @@ where
         .unwrap();
 
     let mut rng = AesRng::new();
-    let output_msgs_1 = encoded_output.extract_outupt_msg1(&mut rng);
+    let party_count = garblers.len() as u16 + 1;
+    let shape = |sender| MsgShape::new(circuit, party_count, sender);
+    let output_msgs_1 = encoded_output
+        .extract_outupt_msg1(&mut rng)
+        .into_iter()
+        .map(|msg| relay(msg, &shape(party_count - 1)))
+        .collect_vec();
     let has_check_round = !output_msgs_1.is_empty();
 
     let chi = if has_check_round {
@@ -257,9 +323,10 @@ where
         .into_iter()
         .zip(output_msgs_1)
         .map(|(garbler, msg1)| {
-            garbler
+            let msg2 = garbler
                 .check_output_msg1(msg1, &masked_inputs, circuit)
-                .unwrap()
+                .unwrap();
+            relay(msg2, &shape(garbler.party_id()))
         })
         .collect_vec();
 
@@ -451,10 +518,15 @@ mod test {
     use swanky_field_binary::F2;
 
     use crate::{
-        NamedCircuit, eval_clear_circuit,
+        MsgShape, NamedCircuit, eval_clear_circuit,
         evaluator::{copz::CopzEvaluator, wrk17::Wrk17Evaluator},
         full_simulation,
-        garbler::{copz::CopzGarbler, wrk17::Wrk17Garbler},
+        garbler::{
+            Garbler,
+            copz::{CopzGarbler, CopzGarbling, CopzInputMsg2},
+            wrk17::{Wrk17Garbler, Wrk17InputMsg2},
+        },
+        net::Wire,
         prep::{InsecurePreprocessor, SecurePrepParams, SecurePreprocessor, run_prep},
     };
 
@@ -524,6 +596,85 @@ mod test {
 
         // shutdown
         prep_handler.join().unwrap();
+    }
+
+    /// Garble `circuit` with the secure preprocessing and return the garblers' circuits.
+    fn garblings<G: Garbler + Send + 'static>(
+        circuit: &NamedCircuit,
+        num_parties: u16,
+        new: impl Fn(u16, SecurePreprocessor) -> G,
+    ) -> Vec<G::Gc>
+    where
+        G::Gc: Send,
+    {
+        let mut garblers = secure_preps(circuit, num_parties, true)
+            .into_iter()
+            .enumerate()
+            .map(|(party_id, prep)| new(party_id as u16, prep))
+            .collect_vec();
+        std::thread::scope(|s| {
+            let handles = garblers
+                .iter_mut()
+                .map(|g| {
+                    s.spawn(|| {
+                        let mut rng = AesRng::new();
+                        g.garble(&mut rng, &circuit.circuit)
+                    })
+                })
+                .collect_vec();
+            let mut gcs = handles.into_iter().map(|h| h.join().unwrap()).collect_vec();
+            gcs.pop(); // the evaluator's garbling is never sent
+            gcs
+        })
+    }
+
+    /// Check that `gcs` roundtrip and that wrong lengths or senders are rejected.
+    fn check_garbling_encoding<T: Wire<Shape = MsgShape>>(
+        gcs: &[T],
+        circuit: &NamedCircuit,
+        num_parties: u16,
+    ) {
+        for (sender, gc) in gcs.iter().enumerate() {
+            let shape = MsgShape::new(&circuit.circuit, num_parties, sender as u16);
+            let bytes = gc.to_wire_bytes();
+            let decoded = T::from_wire_bytes(&bytes, &shape).unwrap();
+            assert_eq!(decoded.to_wire_bytes(), bytes);
+            assert!(T::from_wire_bytes(&bytes[1..], &shape).is_err());
+            assert!(T::from_wire_bytes(&[bytes.as_slice(), &[0]].concat(), &shape).is_err());
+            let wrong_parties = MsgShape {
+                party_count: num_parties + 1,
+                ..shape
+            };
+            assert!(T::from_wire_bytes(&bytes, &wrong_parties).is_err());
+        }
+    }
+
+    #[test]
+    fn test_garbling_encoding() {
+        let circuit = NamedCircuit::from_path("circuits/and2.txt");
+        let n = 3;
+        let gcs = garblings(&circuit, n, |i, p| Wrk17Garbler::new(i, n, p));
+        check_garbling_encoding(&gcs, &circuit, n);
+
+        let gcs = garblings(&circuit, n, |i, p| CopzGarbler::new(i, n, p));
+        check_garbling_encoding(&gcs, &circuit, n);
+        // only party 0 sends the bits b_w, so the senders cannot be confused
+        let bytes0 = gcs[0].to_wire_bytes();
+        let bytes1 = gcs[1].to_wire_bytes();
+        let shape = |sender| MsgShape::new(&circuit.circuit, n, sender);
+        assert!(CopzGarbling::from_wire_bytes(&bytes0, &shape(1)).is_err());
+        assert!(CopzGarbling::from_wire_bytes(&bytes1, &shape(0)).is_err());
+    }
+
+    #[test]
+    fn test_input_messages_reject_padding() {
+        // and2 has three inputs, so one byte with five padding bits
+        let circuit = NamedCircuit::from_path("circuits/and2.txt");
+        let shape = MsgShape::new(&circuit.circuit, 3, 2);
+        assert_eq!(shape.inputs, 3);
+        assert!(Wrk17InputMsg2::from_wire_bytes(&[0b111], &shape).is_ok());
+        assert!(Wrk17InputMsg2::from_wire_bytes(&[0b1111], &shape).is_err());
+        assert!(CopzInputMsg2::from_wire_bytes(&[0b1000], &shape).is_err());
     }
 
     /// Run the secure preprocessing for all parties.

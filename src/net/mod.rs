@@ -29,8 +29,10 @@ pub mod memory;
 mod session;
 #[cfg(test)]
 mod tests;
+pub mod wire;
 
 pub use session::{ByteChannel, COMMITMENT_LEN, Commitment, NONCE_LEN, Nonce, Seed, Session};
+pub use wire::{Bits, PerParty, Wire};
 
 pub type PartyId = u16;
 
@@ -54,6 +56,8 @@ pub enum NetError {
         expected: usize,
         received: usize,
     },
+    #[error("malformed message from party {party}: {reason}")]
+    Malformed { party: PartyId, reason: String },
     #[error("party {0} exceeded the receive buffer limit")]
     BufferLimit(PartyId),
     #[error("cheating detected: {0}")]

@@ -1,12 +1,10 @@
 use itertools::{Itertools, izip};
 use rand::{Rng, SeedableRng, seq::SliceRandom};
-use scuttlebutt::{AesRng, ring::FiniteRing, serialization::CanonicalSerialize};
+use scuttlebutt::{AesRng, ring::FiniteRing};
 use swanky_field_binary::{F2, F128b};
 
-use super::{
-    Cheat, F128B_LEN, HashDomain, SecurePreprocessor, bytes_to_f128b, f128b_to_bytes, hash, lsb,
-    mul_bit, pack_bits, seed_to_block, unpack_bits,
-};
+use super::{Cheat, HashDomain, SecurePreprocessor, hash, lsb, mul_bit, seed_to_block};
+use crate::net::{Bits, Wire};
 use crate::prep::{ReceiverParty, StaticPreprocessor, Triple};
 use crate::{error::GcError, sharing::AuthShare, universal_hash};
 
@@ -32,7 +30,7 @@ impl SecurePreprocessor {
         // Π_HaAND: compute shares v of sum_i sum_{j != i} x^j y^i
         let flip_y = self.cheating(Cheat::HalfAndFlipY);
         let mut vs = vec![false; count];
-        let mut msgs = vec![vec![]; n];
+        let mut msgs = vec![Bits(vec![]); n];
         for &j in &peers {
             let mut h0 = Vec::with_capacity(count);
             let mut h1 = Vec::with_capacity(count);
@@ -55,11 +53,13 @@ impl SecurePreprocessor {
                         ^ y,
                 );
             }
-            msgs[j as usize] = pack_bits(h0.into_iter().chain(h1));
+            msgs[j as usize] = Bits(h0.into_iter().chain(h1).collect());
         }
-        let received = self.session.exchange(&msgs, (2 * count).div_ceil(8))?;
+        let received = self
+            .session
+            .exchange_msg(|j| std::mem::take(&mut msgs[j as usize]), &(2 * count))?;
         for &i in &peers {
-            let h = unpack_bits(&received[i as usize], 2 * count);
+            let h = &received[i as usize].0;
             for (t, v) in vs.iter_mut().enumerate() {
                 let x = x_bit(t);
                 let mac = xs[t].mac_values[i as usize];
@@ -72,27 +72,31 @@ impl SecurePreprocessor {
         let es = izip!(&xs, &ys, &rs, &vs)
             .map(|(x, y, r, v)| bool::from(x.share * y.share + r.share) ^ v)
             .collect_vec();
-        let mut my_e = pack_bits(es);
+        let mut my_e = Bits(es);
         if self.cheating(Cheat::LeakyAndFlipE) {
-            my_e[0] ^= 1;
+            my_e.0[0] ^= true;
         }
         let all_e = if self.cheating(Cheat::EquivocateBroadcast) {
             let mut other_e = my_e.clone();
-            other_e[0] ^= 1;
-            self.session.broadcast_all_with(&my_e, |j| {
-                if j == victim {
-                    other_e.clone()
-                } else {
-                    my_e.clone()
-                }
-            })?
+            other_e.0[0] ^= true;
+            self.session.broadcast_all_msg_with(
+                &my_e,
+                |j| {
+                    if j == victim {
+                        other_e.clone()
+                    } else {
+                        my_e.clone()
+                    }
+                },
+                &count,
+            )?
         } else {
-            self.session.broadcast_all(&my_e)?
+            self.session.broadcast_all_msg(&my_e, &count)?
         };
         let mut zs = rs;
         for (i, e) in all_e.iter().enumerate() {
-            for (z, e) in zs.iter_mut().zip(unpack_bits(e, count)) {
-                if e {
+            for (z, e) in zs.iter_mut().zip(&e.0) {
+                if *e {
                     if i == me as usize {
                         z.share += F2::ONE;
                     } else {
@@ -109,7 +113,7 @@ impl SecurePreprocessor {
             .collect_vec();
         let wrong_u = self.cheating(Cheat::LeakyAndWrongU);
         let mut key_phis = vec![vec![]; n];
-        let mut msgs = vec![vec![]; n];
+        let mut u_msgs = vec![vec![]; n];
         for &j in &peers {
             let (k_phis, us): (Vec<_>, Vec<_>) = xs
                 .iter()
@@ -128,9 +132,11 @@ impl SecurePreprocessor {
                 })
                 .unzip();
             key_phis[j as usize] = k_phis;
-            msgs[j as usize] = f128b_to_bytes(&us);
+            u_msgs[j as usize] = us;
         }
-        let received = self.session.exchange(&msgs, count * F128B_LEN)?;
+        let received = self
+            .session
+            .exchange_msg(|j| std::mem::take(&mut u_msgs[j as usize]), &(count, ()))?;
         let mut hs = izip!(&xs, &zs, &phis)
             .map(|(x, z, phi)| {
                 mul_bit(bool::from(x.share), *phi)
@@ -140,11 +146,10 @@ impl SecurePreprocessor {
             })
             .collect_vec();
         for &k in &peers {
-            let us = bytes_to_f128b(&received[k as usize]);
-            for (t, (h, u)) in hs.iter_mut().zip(us).enumerate() {
+            for (t, (h, u)) in hs.iter_mut().zip(&received[k as usize]).enumerate() {
                 let x = x_bit(t);
                 let mac = xs[t].mac_values[k as usize];
-                let m_phi = mul_bit(x, u) + hash(&tccr, mac, HashDomain::LeakyAnd, t, k, me, x);
+                let m_phi = mul_bit(x, *u) + hash(&tccr, mac, HashDomain::LeakyAnd, t, k, me, x);
                 *h += key_phis[k as usize][t] + m_phi;
             }
         }
@@ -155,19 +160,20 @@ impl SecurePreprocessor {
         if self.cheating(Cheat::LeakyAndWrongH) {
             h += F128b::ONE;
         }
-        let (com, nonce) = self.session.commit(&mut self.rng, &h.to_bytes());
-        let coms = self.session.broadcast_all(&com)?;
-        let opening = h.to_bytes().into_iter().chain(nonce).collect_vec();
-        let openings = self.session.broadcast_all(&opening)?;
+        let (com, nonce) = self.session.commit(&mut self.rng, &h.to_wire_bytes());
+        let coms = self.session.broadcast_all_msg(&com, &())?;
+        let openings = self.session.broadcast_all_msg(&(h, nonce), &((), ()))?;
         let mut sum = F128b::ZERO;
-        for (i, (com, opening)) in coms.iter().zip(&openings).enumerate() {
-            let (h, nonce) = opening.split_at(F128B_LEN);
-            if !self.session.verify_commitment(com, h, nonce) {
+        for (i, (com, (h, nonce))) in coms.iter().zip(&openings).enumerate() {
+            if !self
+                .session
+                .verify_commitment(com, &h.to_wire_bytes(), nonce)
+            {
                 self.detected(GcError::CheatDetected(format!(
                     "party {i} opened the AND triple check commitment incorrectly"
                 )))?;
             }
-            sum += bytes_to_f128b(h)[0];
+            sum += *h;
         }
         if sum != F128b::ZERO {
             self.detected(GcError::CheatDetected(

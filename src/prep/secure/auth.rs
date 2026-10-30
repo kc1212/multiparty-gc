@@ -7,11 +7,8 @@ use rand::{Rng, SeedableRng};
 use scuttlebutt::{AesRng, Block, ring::FiniteRing, serialization::CanonicalSerialize};
 use swanky_field_binary::{F2, F128b};
 
-use super::{
-    Cheat, F128B_LEN, SecurePreprocessor, block_to_f128b, bytes_to_f128b, f128b_to_bytes, mul_bit,
-    seed_to_block,
-};
-use crate::net::{COMMITMENT_LEN, NONCE_LEN};
+use super::{Cheat, SecurePreprocessor, block_to_f128b, mul_bit, seed_to_block};
+use crate::net::{Bits, Wire};
 use crate::{error::GcError, sharing::AuthShare};
 
 impl SecurePreprocessor {
@@ -171,18 +168,15 @@ impl SecurePreprocessor {
             }
         }
 
-        let all_bits = self.session.broadcast_all(&combined_bits.to_le_bytes())?;
-        let msgs = combined_macs
-            .iter()
-            .map(|m| f128b_to_bytes(m))
-            .collect_vec();
-        let received = self.session.exchange(&msgs, rho * F128B_LEN)?;
-        for &i in &peers {
-            let their_bits = u128::from_le_bytes(all_bits[i].as_slice().try_into().unwrap());
-            let their_macs = bytes_to_f128b(&received[i]);
-            for (j, mac) in their_macs.into_iter().enumerate() {
-                let bit = (their_bits >> j) & 1 == 1;
-                if mac != combined_keys[i][j] + mul_bit(bit, self.delta) {
+        let combined_bits = Bits((0..rho).map(|j| (combined_bits >> j) & 1 == 1).collect());
+        let all_bits = self.session.broadcast_all_msg(&combined_bits, &rho)?;
+        let received = self
+            .session
+            .exchange_msg(|k| combined_macs[k as usize].clone(), &(rho, ()))?;
+        for (i, their_macs) in received.iter() {
+            let i = i as usize;
+            for (j, mac) in their_macs.iter().enumerate() {
+                if *mac != combined_keys[i][j] + mul_bit(all_bits[i].0[j], self.delta) {
                     self.detected(GcError::CheatDetected(format!(
                         "authenticated bit consistency check failed for party {i}"
                     )))?;
@@ -202,11 +196,7 @@ impl SecurePreprocessor {
     fn check_delta_consistency(&mut self, shares: &[AuthShare<F2, F128b>]) -> Result<(), GcError> {
         let n = self.party_count as usize;
         let me = self.party_id as usize;
-        let peers = self.session.peers().map(|p| p as usize).collect_vec();
-        // a bit and n MACs (including the empty one for ourselves)
-        let mac_msg_len = 1 + n * F128B_LEN;
-        let mac_opening_len = mac_msg_len + NONCE_LEN;
-        let key_opening_len = F128B_LEN + NONCE_LEN;
+        let count = shares.len();
 
         let mut my_coms = vec![];
         let mut my_mac_openings = vec![];
@@ -214,34 +204,36 @@ impl SecurePreprocessor {
         for share in shares {
             let key0 = share.sum_mac_keys();
             let key1 = key0 + self.delta;
-            let (com0, nonce0) = self.session.commit(&mut self.rng, &key0.to_bytes());
-            let (com1, nonce1) = self.session.commit(&mut self.rng, &key1.to_bytes());
-            let mac_msg = std::iter::once(bool::from(share.share) as u8)
-                .chain(f128b_to_bytes(&share.mac_values))
-                .collect_vec();
-            let (com_mac, nonce_mac) = self.session.commit(&mut self.rng, &mac_msg);
-            my_coms.extend(com0.into_iter().chain(com1).chain(com_mac));
-            my_mac_openings.extend(mac_msg.into_iter().chain(nonce_mac));
+            let (com0, nonce0) = self.session.commit(&mut self.rng, &key0.to_wire_bytes());
+            let (com1, nonce1) = self.session.commit(&mut self.rng, &key1.to_wire_bytes());
+            // the bit and all MACs (including the empty one for ourselves)
+            let mac_msg = (bool::from(share.share), share.mac_values.to_vec());
+            let (com_mac, nonce_mac) = self.session.commit(&mut self.rng, &mac_msg.to_wire_bytes());
+            my_coms.push((com0, com1, com_mac));
+            my_mac_openings.push((mac_msg, nonce_mac));
             key_openings.push([(key0, nonce0), (key1, nonce1)]);
         }
-        let coms = self.session.broadcast_all(&my_coms)?;
-        let mac_openings = self.session.broadcast_all(&my_mac_openings)?;
+        let coms = self
+            .session
+            .broadcast_all_msg(&my_coms, &(count, ((), (), ())))?;
+        let mac_openings = self
+            .session
+            .broadcast_all_msg(&my_mac_openings, &(count, (((), (n, ())), ())))?;
 
         // bits[i][r] and macs[i][r][k] = M_k[x^i_r]
-        let mut bits = vec![vec![false; shares.len()]; n];
-        let mut macs = vec![vec![vec![]; shares.len()]; n];
-        for i in 0..n {
-            for r in 0..shares.len() {
-                let opening = &mac_openings[i][r * mac_opening_len..(r + 1) * mac_opening_len];
-                let (msg, nonce) = opening.split_at(mac_msg_len);
-                let com = &coms[i][(r * 3 + 2) * COMMITMENT_LEN..(r * 3 + 3) * COMMITMENT_LEN];
-                if !self.session.verify_commitment(com, msg, nonce) || msg[0] > 1 {
+        let mut bits = vec![vec![false; count]; n];
+        let mut macs = vec![vec![vec![]; count]; n];
+        for (i, openings) in mac_openings.into_iter().enumerate() {
+            for (r, (mac_msg, nonce)) in openings.into_iter().enumerate() {
+                if !self
+                    .session
+                    .verify_commitment(&coms[i][r].2, &mac_msg.to_wire_bytes(), &nonce)
+                {
                     self.detected(GcError::CheatDetected(format!(
                         "party {i} opened a MAC commitment incorrectly"
                     )))?;
                 }
-                bits[i][r] = msg[0] == 1;
-                macs[i][r] = bytes_to_f128b(&msg[1..]);
+                (bits[i][r], macs[i][r]) = mac_msg;
             }
         }
         let parity = |i: usize, r: usize| {
@@ -253,24 +245,26 @@ impl SecurePreprocessor {
         let my_key_openings = key_openings
             .iter()
             .enumerate()
-            .flat_map(|(r, openings)| {
-                let (key, nonce) = openings[parity(me, r) as usize];
-                key.to_bytes().into_iter().chain(nonce)
-            })
+            .map(|(r, openings)| openings[parity(me, r) as usize])
             .collect_vec();
-        let all_key_openings = self.session.broadcast_all(&my_key_openings)?;
+        let all_key_openings = self
+            .session
+            .broadcast_all_msg(&my_key_openings, &(count, ((), ())))?;
 
-        for &i in &peers {
-            for r in 0..shares.len() {
-                let b = parity(i, r) as usize;
-                let opening = &all_key_openings[i][r * key_opening_len..(r + 1) * key_opening_len];
-                let (key, nonce) = opening.split_at(F128B_LEN);
-                let com = &coms[i][(r * 3 + b) * COMMITMENT_LEN..(r * 3 + b + 1) * COMMITMENT_LEN];
+        for i in self.session.peers().map(|p| p as usize) {
+            for (r, (key, nonce)) in all_key_openings[i].iter().enumerate() {
+                let com = if parity(i, r) {
+                    &coms[i][r].1
+                } else {
+                    &coms[i][r].0
+                };
                 let expected = (0..n)
                     .filter(|k| *k != i)
                     .fold(F128b::ZERO, |acc, k| acc + macs[k][r][i]);
-                if !self.session.verify_commitment(com, key, nonce)
-                    || bytes_to_f128b(key)[0] != expected
+                if !self
+                    .session
+                    .verify_commitment(com, &key.to_wire_bytes(), nonce)
+                    || *key != expected
                 {
                     self.detected(GcError::CheatDetected(format!(
                         "global key consistency check failed for party {i}"

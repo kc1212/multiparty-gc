@@ -38,7 +38,7 @@ use swanky_field_binary::{F2, F128b};
 use crate::{
     error::GcError,
     net::{
-        NetworkConfig, Session,
+        Bits, NetworkConfig, Session,
         memory::{LinkModel, mesh},
     },
     sharing::AuthShare,
@@ -328,14 +328,14 @@ impl SecurePreprocessor {
             std::thread::sleep(dur);
         }
 
-        let mut my_shares = pack_bits(xs.iter().map(|x| bool::from(x.share)));
+        let mut my_shares = Bits(xs.iter().map(|x| bool::from(x.share)).collect());
         let wrong_opening = if self.prepped {
             Cheat::BeaverWrongOpening
         } else {
             Cheat::BucketWrongOpening
         };
         if self.cheating(wrong_opening) && !xs.is_empty() {
-            my_shares[0] ^= 1;
+            my_shares.0[0] ^= true;
         }
         for peer in self.session.peers() {
             if is_receiver(peer) {
@@ -343,20 +343,17 @@ impl SecurePreprocessor {
                     self.session.sid(),
                     xs.iter().map(|x| x.mac_values[peer as usize]),
                 );
-                self.session
-                    .send(peer, &[my_shares.as_slice(), &digest].concat())?;
+                self.session.send_msg(peer, &(my_shares.clone(), digest))?;
             }
         }
         if !is_receiver(me) {
             return Ok(None);
         }
 
-        let shares_len = xs.len().div_ceil(8);
         let mut output = xs.iter().map(|x| bool::from(x.share)).collect_vec();
         for peer in self.session.peers() {
-            let msg = self.session.recv(peer, shares_len + blake3::OUT_LEN)?;
-            let (shares, digest) = msg.split_at(shares_len);
-            let shares = unpack_bits(shares, xs.len());
+            let (Bits(shares), digest): (Bits, [u8; blake3::OUT_LEN]) =
+                self.session.recv_msg(peer, &(xs.len(), ()))?;
             let expected = mac_digest(
                 self.session.sid(),
                 xs.iter()
@@ -453,35 +450,6 @@ fn lsb(x: F128b) -> bool {
 
 fn mul_bit(b: bool, x: F128b) -> F128b {
     if b { x } else { F128b::ZERO }
-}
-
-fn f128b_to_bytes(xs: &[F128b]) -> Vec<u8> {
-    xs.iter().flat_map(|x| x.to_bytes()).collect()
-}
-
-fn bytes_to_f128b(bytes: &[u8]) -> Vec<F128b> {
-    bytes
-        .chunks_exact(F128B_LEN)
-        .map(|b| F128b::from_uniform_bytes(b.try_into().unwrap()))
-        .collect()
-}
-
-fn pack_bits(bits: impl IntoIterator<Item = bool>) -> Vec<u8> {
-    bits.into_iter()
-        .chunks(8)
-        .into_iter()
-        .map(|chunk| {
-            chunk
-                .enumerate()
-                .fold(0u8, |acc, (i, b)| acc | ((b as u8) << i))
-        })
-        .collect()
-}
-
-fn unpack_bits(bytes: &[u8], len: usize) -> Vec<bool> {
-    (0..len)
-        .map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1)
-        .collect()
 }
 
 #[cfg(test)]
