@@ -2,6 +2,8 @@ use std::sync::mpsc::{RecvError, SendError};
 
 use thiserror::Error;
 
+use crate::net::NetError;
+
 #[derive(Error, Debug)]
 pub enum GcError {
     #[error(transparent)]
@@ -28,12 +30,23 @@ pub enum GcError {
     CheatDetected(String),
     #[error("Network error: {0}")]
     NetworkError(String),
+    #[error(transparent)]
+    Net(NetError),
     #[error("Oblivious transfer error: {0}")]
     OtError(String),
     #[error("Not enough preprocessed material: {0}")]
     NotEnoughMaterial(String),
     #[error("Invalid preprocessing parameters: {0}")]
     InvalidPrepParams(String),
+}
+
+impl From<NetError> for GcError {
+    fn from(err: NetError) -> Self {
+        match err {
+            NetError::CheatDetected(msg) => Self::CheatDetected(msg),
+            err => Self::Net(err),
+        }
+    }
 }
 
 impl From<ocelot::Error> for GcError {

@@ -16,6 +16,7 @@ use swanky_field_binary::{F2, F128b};
 pub mod error;
 pub mod evaluator;
 pub mod garbler;
+pub mod net;
 pub mod prep;
 pub mod sharing;
 
